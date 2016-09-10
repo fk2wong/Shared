@@ -26,14 +26,14 @@
 #endif // USE_DEBUG_CODE
 
 #if USE_PRODUCTION_CODE
-#define require_noerr( err, label )         \
-	do                                      \
-	{                                       \
-		if ( __builtin_expect( err != 0  )) \
-		{                                   \
-			goto label;                     \
-		}                                   \
-	}                                       \
+#define require_noerr( err, label )           \
+	do                                        \
+	{                                         \
+		if ( __builtin_expect( err != 0, 0 )) \
+		{                                     \
+			goto label;                       \
+		}                                     \
+	}                                         \
 	while ( 0 )
 #else
 #define require_noerr( err, label ) //TODO
