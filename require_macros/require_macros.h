@@ -12,28 +12,28 @@
 #define USE_PRODUCTION_CODE 1
 
 #if USE_PRODUCTION_CODE
-#define require( assertation, label )             \
-	do                                            \
-	{                                             \
-		if ( __builtin_expect( !assertation, 0 )) \
-		{                                         \
-			goto label;                           \
-		}                                         \
-	}                                             \
+#define require( assertation, label )                 \
+	do                                                \
+	{                                                 \
+		if ( __builtin_expect( !( assertation ), 0 )) \
+		{                                             \
+			goto label;                               \
+		}                                             \
+	}                                                 \
 	while ( 0 )
 #else
 #define require( assertation, label ) //TODO                   
 #endif // USE_DEBUG_CODE
 
 #if USE_PRODUCTION_CODE
-#define require_noerr( err, label )           \
-	do                                        \
-	{                                         \
-		if ( __builtin_expect( err != 0, 0 )) \
-		{                                     \
-			goto label;                       \
-		}                                     \
-	}                                         \
+#define require_noerr( err, label )              \
+	do                                           \
+	{                                            \
+		if ( __builtin_expect(( err ) != 0, 0 )) \
+		{                                        \
+			goto label;                          \
+		}                                        \
+	}                                            \
 	while ( 0 )
 #else
 #define require_noerr( err, label ) //TODO
@@ -43,7 +43,7 @@
 #define require_quiet( assertation, label )           \
 	do                                                \
 	{                                                 \
-		if ( __builtin_expect( !assertation, false )) \
+		if ( __builtin_expect( !( assertation ), 0 )) \
 		{                                             \
 			goto label;                               \
 		}                                             \
@@ -54,14 +54,14 @@
 #endif // USE_DEBUG_CODE
 
 #if USE_PRODUCTION_CODE
-#define require_noerr_quiet( err, label )         \
-	do                                            \
-	{                                             \
-		if ( __builtin_expect( err != 0, false )) \
-		{                                         \
-			goto label;                           \
-		}                                         \
-	}                                             \
+#define require_noerr_quiet( err, label )        \
+	do                                           \
+	{                                            \
+		if ( __builtin_expect(( err ) != 0, 0 )) \
+		{                                        \
+			goto label;                          \
+		}                                        \
+	}                                            \
 	while ( 0 )
 #else
 #define require_noerr_quiet( err, label ) //TODO
