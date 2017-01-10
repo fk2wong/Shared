@@ -6,8 +6,8 @@
 
 F_ENUM( uint8_t, FStatus )
 {
-	FStatusSuccess            = 0,
-	FStatusFailed             = 1,
-	FStatusAlreadyInitialized = 2,
-	FStatusNotInitialized     = 3,
+	FStatus_Success            = 0,
+	FStatus_Failed             = 1,
+	FStatus_AlreadyInitialized = 2,
+	FStatus_NotInitialized     = 3,
 };
