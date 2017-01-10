@@ -10,6 +10,9 @@
 #define FUTILITIES_H_
 
 #include <avr/io.h>
+#include "stdint.h"
+
+#define F_ENUM( TYPE, NAME ) typedef TYPE NAME; enum
 
 #define MAX( X, Y )   ((( X ) > ( Y )) ? ( X ) : ( Y ))
 #define MIN( X, Y )   ((( X ) < ( Y )) ? ( X ) : ( Y ))
