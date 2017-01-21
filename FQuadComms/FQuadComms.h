@@ -19,6 +19,11 @@ FStatus FQuadComms_SendControls( const FQuadAxisValue inPitch, const FQuadAxisVa
 
 FStatus FQuadComms_ReceiveControls( FQuadAxisValue *const outPitch, FQuadAxisValue *const outRoll, FQuadAxisValue *const outYaw, FQuadThrustValue *const outThrust );
 
+// Battery, RSSI
+FStatus FQuadComms_ReceiveStatus( );
+
+FStatus FQuadComms_SendStatus( );
+
 FStatus FQuadComms_Sleep();
 
 FStatus FQuadComms_Wake();
