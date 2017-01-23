@@ -13,7 +13,13 @@
 #include "FQuadDefs.h"
 #include "PlatformGPIO.h"
 
-FStatus FQuadComms_Init( const PlatformGPIO_t inSleepPin );
+F_ENUM( uint8_t, FQuadCommsType_t )
+{
+	FQuadCommsType_Flight,
+	FQuadCommsType_Controller,
+};
+
+FStatus FQuadComms_Init( const PlatformGPIO_t inSleepPin, FQuadCommsType_t inCommsType );
 
 FStatus FQuadComms_SendControls( const FQuadAxisValue inPitch, const FQuadAxisValue inRoll, const FQuadAxisValue inYaw, const FQuadThrustValue inThrust );
 
