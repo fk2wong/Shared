@@ -33,6 +33,8 @@
 
 #define FQUAD_COMMS_START_FRAME_ID ( 1 )
 
+#define FQUAD_COMMS_WAKE_TIME_MS ( 4 )
+
 #define FQUAD_ADDRH   ( 0x13A200 )
 #define FQUAD_ADDRL   ( 0x40B39D9C )
 #define FQUADTX_ADDRH ( 0x13A200 )
@@ -43,7 +45,8 @@
 typedef struct
 {
 	bool                isInitialized;
-	FQuadCommsType_t    commsType;
+	
+	PlatformGPIO_t      sleepPin;
 	
 	PlatformRingBuffer *uartBuffer;
 	uint8_t             lastFrameID;
@@ -54,8 +57,8 @@ typedef struct
 	FQuadThrustValue    latestThrust;
 	
 	FQuadBatteryLevel   latestBatteryLevel;
-	FStatus             latestFlightRSSI;
-	FStatus             latestControllerRSSI;
+	FQuadRSSI           latestFlightRSSI;
+	FQuadRSSI           latestControllerRSSI;
 	
 	uint8_t             latestACKFrameID;
 	uint8_t             latestACKStatus;
@@ -102,7 +105,7 @@ typedef struct __attribute__ (( packed ))
 	FQuadCommsCmd_t     cmd;  
 	uint32_t            sourceADDRH;
 	uint32_t            sourceADDRL;
-	uint8_t             RSSI;
+	int8_t              RSSI;
 	FQuadCommsRXOptions options;
 	uint8_t             data[FQUAD_COMMS_MAX_TX_DATA_LEN];
 } FQuadCommsRXFrameData_t;
@@ -139,12 +142,11 @@ static FStatus _FQuadComms_SerializePacket( FQuadCommsPacket_t *const outPacket,
 static FStatus _FQuadComms_GetChecksum(  void *const inData, size_t inDataLen, uint8_t *const outChecksum );
 static FStatus _FQuadComms_SendPacket( FQuadCommsPacket_t *const inPacket );
 
-
 static FStatus _FQuadComms_RetrieveAndSortAllNewPackets( bool *const wasACKReceived, bool *const wasDataReceived );
 static FStatus _FQuadComms_SortPacket( uint8_t *const inFrameData, uint16_t inFrameLength, FQuadCommsCmd_t *const outSortedPacketCmd );
 static FStatus _FQuadComms_WaitForAck( uint16_t inTimeoutMs );
 
-FStatus FQuadComms_Init( const PlatformGPIO_t inSleepPin, FQuadCommsType_t inCommsType )
+FStatus FQuadComms_Init( const PlatformGPIO_t inSleepPin )
 {
 	FStatus status = FStatus_Failed;
 	PlatformStatus platformStatus;
@@ -171,12 +173,12 @@ FStatus FQuadComms_Init( const PlatformGPIO_t inSleepPin, FQuadCommsType_t inCom
 	platformStatus = PlatformTimer_Init();
 	require(( platformStatus == PlatformStatus_Success ) || ( platformStatus == PlatformStatus_AlreadyInitialized ), exit );
 	
-	// Determine whether this is the flight or controller side
-	mCommsInfoStruct.commsType = inCommsType;
-	
 	// Initialize frame IDs, for matching ACKs
 	mCommsInfoStruct.lastFrameID      = FQUAD_COMMS_START_FRAME_ID;
 	mCommsInfoStruct.latestACKFrameID = FQUAD_COMMS_START_FRAME_ID - 1;
+	
+	// Save sleep pin info
+	mCommsInfoStruct.sleepPin = inSleepPin;
 	
 	mCommsInfoStruct.isInitialized = true;
 	
@@ -189,7 +191,7 @@ FStatus FQuadComms_SendControls( const FQuadAxisValue inPitch, const FQuadAxisVa
 {
 	FStatus status = FStatus_Failed;
 	FQuadCommsTXFrameData_t txCmdData;
-	FQuadCommsPacket_t    txPacket;
+	FQuadCommsPacket_t      txPacket;
 	
 	// Fill TX command specific data
 	txCmdData.cmd       = FQuadCommsCmd_TX64Bit;
@@ -211,10 +213,43 @@ FStatus FQuadComms_SendControls( const FQuadAxisValue inPitch, const FQuadAxisVa
 	status = _FQuadComms_SendPacket( &txPacket );
 	require_noerr( status, exit );
 	
-	// Wait for ACK TODO
+	// Wait for ACK
 	status = _FQuadComms_WaitForAck( FQUAD_COMMS_ACK_TIMEOUT_MS );
+	require_noerr( status, exit );
 	
-	status = FStatus_Success;
+exit:
+	return status;
+}
+
+
+FStatus FQuadComms_SendFlightBatteryLevelAndRSSI( const FQuadBatteryLevel inBatteryLevel, const FQuadRSSI inFlightRSSI )
+{
+	FStatus status = FStatus_Failed;
+	FQuadCommsTXFrameData_t txCmdData;
+	FQuadCommsPacket_t      txPacket;
+	
+	// Fill TX command specific data
+	txCmdData.cmd       = FQuadCommsCmd_TX64Bit;
+	txCmdData.frameID   = ++mCommsInfoStruct.lastFrameID;
+	txCmdData.destADDRH = HTONL( FQUAD_ADDRH );
+	txCmdData.destADDRL = HTONL( FQUAD_ADDRL );
+	txCmdData.data[0]   = FQuadCommsDataType_FlightStatus;
+	txCmdData.data[1]   = inBatteryLevel;
+	txCmdData.data[2]   = inFlightRSSI;
+	txCmdData.options   = FQuadCommsTXOptions_None;
+	
+	// Create packet
+	status = _FQuadComms_SerializePacket( &txPacket, &txCmdData, sizeof( FQuadCommsTXFrameData_t ));
+	require_noerr( status, exit );
+	
+	// Send the packet
+	status = _FQuadComms_SendPacket( &txPacket );
+	require_noerr( status, exit );
+	
+	// Wait for ACK
+	status = _FQuadComms_WaitForAck( FQUAD_COMMS_ACK_TIMEOUT_MS );
+	require_noerr( status, exit );
+	
 exit:
 	return status;
 }
@@ -259,6 +294,62 @@ exit:
 	return status;
 }
 
+FStatus FQuadComms_GetLatestFlightBatteryLevel( FQuadBatteryLevel *const outBatteryLevel )
+{
+	FStatus status = FStatus_InvalidArgument;
+	
+	require( outBatteryLevel, exit );
+
+	status = _FQuadComms_RetrieveAndSortAllNewPackets( NULL, NULL );
+	require_noerr( status, exit );
+	
+	*outBatteryLevel  = mCommsInfoStruct.latestBatteryLevel;
+
+exit:
+	return status;
+}
+
+FStatus FQuadComms_GetLatestRSSI( FQuadRSSI *const outControllerRSSI, FQuadRSSI *const outFlightRSSI )
+{
+	FStatus status;
+
+	status = _FQuadComms_RetrieveAndSortAllNewPackets( NULL, NULL );
+	require_noerr( status, exit );
+	
+	if ( outControllerRSSI != NULL )
+	{
+		*outControllerRSSI = mCommsInfoStruct.latestControllerRSSI;
+	}
+	if ( outFlightRSSI != NULL )
+	{
+		*outFlightRSSI = mCommsInfoStruct.latestFlightRSSI;
+	}
+
+exit:
+	return status;
+}
+
+FStatus FQuadComms_Sleep()
+{
+	PlatformStatus platformStatus;
+	
+	platformStatus = PlatformGPIO_OutputHigh( mCommsInfoStruct.sleepPin );
+	
+	return ( platformStatus == PlatformStatus_Success ) ? FStatus_Success : FStatus_Failed;
+}
+
+FStatus FQuadComms_Wake()
+{
+	PlatformStatus platformStatus;
+	
+	platformStatus = PlatformGPIO_OutputLow( mCommsInfoStruct.sleepPin );
+	
+	// Wait enough time for the module to exit sleep mode 
+	// TODO change this to timer?
+	_delay_ms( FQUAD_COMMS_WAKE_TIME_MS );
+	
+	return ( platformStatus == PlatformStatus_Success ) ? FStatus_Success : FStatus_Failed;
+}
 
 static FStatus _FQuadComms_SerializePacket( FQuadCommsPacket_t *const outPacket, void *const inData, size_t inDataLen )
 {

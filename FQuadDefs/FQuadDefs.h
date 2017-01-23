@@ -13,6 +13,7 @@ typedef int8_t  FQuadAxisValue;
 typedef uint8_t FQuadThrustValue;
 
 typedef uint8_t FQuadBatteryLevel;
+typedef int8_t  FQuadRSSI;
 
 
 #endif /* FQUADDEFS_H_ */
