@@ -31,6 +31,8 @@
 
 #define FQUAD_COMMS_START_BYTE ( 0x7E )
 
+#define FQUAD_COMMS_START_FRAME_ID ( 1 )
+
 #define FQUAD_ADDRH   ( 0x13A200 )
 #define FQUAD_ADDRL   ( 0x40B39D9C )
 #define FQUADTX_ADDRH ( 0x13A200 )
@@ -136,7 +138,11 @@ static FQuadCommsInfoStruct_t mCommsInfoStruct;
 static FStatus _FQuadComms_SerializePacket( FQuadCommsPacket_t *const outPacket, void *const inData, size_t inDataLen );
 static FStatus _FQuadComms_GetChecksum(  void *const inData, size_t inDataLen, uint8_t *const outChecksum );
 static FStatus _FQuadComms_SendPacket( FQuadCommsPacket_t *const inPacket );
-static FStatus _FQuadComms_SortPacket( uint8_t *const inFrameData, uint16_t inFrameLength );
+
+
+static FStatus _FQuadComms_RetrieveAndSortAllNewPackets( bool *const wasACKReceived, bool *const wasDataReceived );
+static FStatus _FQuadComms_SortPacket( uint8_t *const inFrameData, uint16_t inFrameLength, FQuadCommsCmd_t *const outSortedPacketCmd );
+static FStatus _FQuadComms_WaitForAck( uint16_t inTimeoutMs );
 
 FStatus FQuadComms_Init( const PlatformGPIO_t inSleepPin, FQuadCommsType_t inCommsType )
 {
@@ -167,6 +173,10 @@ FStatus FQuadComms_Init( const PlatformGPIO_t inSleepPin, FQuadCommsType_t inCom
 	
 	// Determine whether this is the flight or controller side
 	mCommsInfoStruct.commsType = inCommsType;
+	
+	// Initialize frame IDs, for matching ACKs
+	mCommsInfoStruct.lastFrameID      = FQUAD_COMMS_START_FRAME_ID;
+	mCommsInfoStruct.latestACKFrameID = FQUAD_COMMS_START_FRAME_ID - 1;
 	
 	mCommsInfoStruct.isInitialized = true;
 	
@@ -202,20 +212,49 @@ FStatus FQuadComms_SendControls( const FQuadAxisValue inPitch, const FQuadAxisVa
 	require_noerr( status, exit );
 	
 	// Wait for ACK TODO
-	status = _FQuadComms_WaitForAck( &txPacket );
+	status = _FQuadComms_WaitForAck( FQUAD_COMMS_ACK_TIMEOUT_MS );
 	
 	status = FStatus_Success;
 exit:
 	return status;
 }
 
-FStatus FQuadComms_ReceiveControls( FQuadAxisValue *const outPitch, FQuadAxisValue *const outRoll, FQuadAxisValue *const outYaw, FQuadThrustValue *const outThrust )
+FStatus FQuadComms_ReceiveControls( FQuadAxisValue *const   outPitch, 
+                                    FQuadAxisValue *const   outRoll, 
+									FQuadAxisValue *const   outYaw, 
+									FQuadThrustValue *const outThrust,
+									const uint16_t          inTimeoutMs )
 {
-	FStatus status = FStatus_Failed;
+	FStatus status;
+	bool controlsReceived = false;
 	
-	// TODO
+	uint64_t startTime;
+	uint64_t currentTime;
 	
-	status = FStatus_Success;
+	status = PlatformTimer_GetTime( &currentTime );
+	require_noerr( status, exit );
+	
+	startTime = currentTime;
+	
+	// Loop until controls received, or until timed out
+	while ( ( uint16_t )(( currentTime - startTime ) <= inTimeoutMs ) && !controlsReceived )
+	{
+		status = _FQuadComms_RetrieveAndSortAllNewPackets( NULL, &controlsReceived );
+		require_noerr( status, exit );
+		
+		if ( controlsReceived )
+		{
+			*outPitch  = mCommsInfoStruct.latestPitch;
+			*outRoll   = mCommsInfoStruct.latestRoll;
+			*outYaw    = mCommsInfoStruct.latestYaw;
+			*outThrust = mCommsInfoStruct.latestThrust;
+		}
+		
+		status = PlatformTimer_GetTime( &currentTime );
+		require_noerr( status, exit );
+	}
+	
+	status = ( controlsReceived ) ? FStatus_Success : FStatus_Failed;
 exit:
 	return status;
 }
@@ -291,7 +330,7 @@ exit:
 	return status;
 }
 
-static FStatus _FQuadComms_GetNextReceivedPacket( FQuadCommsPacket_t *const outPacket, uint32_t inTimeoutMs )
+static FStatus _FQuadComms_GetNextReceivedPacket( FQuadCommsPacket_t *const outPacket )
 {
 	FStatus status = FStatus_Failed;
 	PlatformStatus platformStatus;
@@ -301,83 +340,91 @@ static FStatus _FQuadComms_GetNextReceivedPacket( FQuadCommsPacket_t *const outP
 	uint16_t packetLength;
 	uint16_t frameLengthRaw;
 	
-	uint64_t startTime;
-	uint64_t currentTime;
-	
 	require_action( outPacket, exit, status = FStatus_InvalidArgument );
 	
-	platformStatus = PlatformTimer_GetTime( &startTime );
-	require_noerr( platformStatus, exit );
+	// First get enough data to read the length of packet
+	platformStatus = PlatformUART_Receive( rawData, FQUAD_COMMS_HEADER_BYTES );
+	require( platformStatus, exit );
+		
+	// If we received something, the first byte should be a start byte, since nothing else is using the UART
+	require( rawData[0] == FQUAD_COMMS_START_BYTE, exit );
+			
+	// Find the remaining packet length
+	frameLengthRaw = *( uint16_t* )&rawData[1];
+	packetLength   = NTOHS( frameLengthRaw ) + FQUAD_COMMS_OVERHEAD_BYTES;
+			
+	// Get the rest of the packet, which is the frame + checksum
+	platformStatus = PlatformUART_Receive( &rawData[FQUAD_COMMS_HEADER_BYTES], packetLength - FQUAD_COMMS_HEADER_BYTES );
 	
-	currentTime = startTime;
-	
-	// Retry for inTimeoutMs
-	while(( uint32_t )( currentTime - startTime ) <= inTimeoutMs )
+	// If the receive failed, then the packet may still be transmitting over UART. 
+	// Tr waiting a sufficient amount of time for the rest of the packet to be received
+	if ( platformStatus != PlatformStatus_Success )
 	{
-		// First get enough data to read the length of packet
-		platformStatus = PlatformUART_Receive( rawData, FQUAD_COMMS_HEADER_BYTES );
+		// TODO change this to a timer function if keeping a delay?
+		_delay_ms( FQUAD_MAX_PACKET_SEND_TIME_MS * 2 );	
 		
-		// Continue only if we received something
-		if ( platformStatus == PlatformStatus_Success )
-		{
-			// The first byte should be a start byte, since nothing else is using the UART
-			require( rawData[0] == FQUAD_COMMS_START_BYTE, exit );
-			
-			// Wait for the rest of the packet to be received into the ring buffer 
-			// TODO this could be optimized. 
-			// TODO change this to a timer function?
-			_delay_ms( FQUAD_MAX_PACKET_SEND_TIME_MS * 2 );
-			
-			// Find the remaining packet length
-			frameLengthRaw = *( uint16_t* )&rawData[1];
-			packetLength   = NTOHS( frameLengthRaw ) + FQUAD_COMMS_OVERHEAD_BYTES;
-			
-			// Get the rest of the packet, which is the frame + checksum
-			platformStatus = PlatformUART_Receive( &rawData[FQUAD_COMMS_HEADER_BYTES], packetLength - FQUAD_COMMS_HEADER_BYTES );
-			require_noerr( platformStatus, exit );
-			
-			// Check the checksum of the frame (don't include checksum byte in the checksum)
-			_FQuadComms_GetChecksum( &rawData[FQUAD_COMMS_HEADER_BYTES], packetLength - FQUAD_COMMS_OVERHEAD_BYTES, &calculatedChecksum );
-			
-			// Check the checksum matches what we received
-			require( calculatedChecksum == rawData[ FQUAD_COMMS_HEADER_BYTES + packetLength ], exit );
-			
-			// Copy the data into the outPacket
-			outPacket->startByte   = rawData[0];
-			outPacket->frameLength = packetLength - FQUAD_COMMS_OVERHEAD_BYTES;
-			outPacket->checksum    = calculatedChecksum;
-			memcpy( outPacket->frameData, &rawData[FQUAD_COMMS_HEADER_BYTES], outPacket->frameLength );
-		}
-		
-		// Update the current time, for timeout purposes
-		platformStatus = PlatformTimer_GetTime( &currentTime );
+		// Try receiving again
+		platformStatus = PlatformUART_Receive( &rawData[FQUAD_COMMS_HEADER_BYTES], packetLength - FQUAD_COMMS_HEADER_BYTES );
 		require_noerr( platformStatus, exit );
 	}
-	
+			
+	// Check the checksum of the frame (don't include checksum byte in the checksum)
+	_FQuadComms_GetChecksum( &rawData[FQUAD_COMMS_HEADER_BYTES], packetLength - FQUAD_COMMS_OVERHEAD_BYTES, &calculatedChecksum );
+			
+	// Check the checksum matches what we received
+	require( calculatedChecksum == rawData[ FQUAD_COMMS_HEADER_BYTES + packetLength ], exit );
+			
+	// Copy the data into the outPacket
+	outPacket->startByte   = rawData[0];
+	outPacket->frameLength = packetLength - FQUAD_COMMS_OVERHEAD_BYTES;
+	outPacket->checksum    = calculatedChecksum;
+	memcpy( outPacket->frameData, &rawData[FQUAD_COMMS_HEADER_BYTES], outPacket->frameLength );
+		
 	status = FStatus_Success;
 exit:
 	return status;
 }
 
-FStatus _FQuadComms_RetrieveAndSortAllNewPackets( void )
+static FStatus _FQuadComms_RetrieveAndSortAllNewPackets( bool *const wasACKReceived, bool *const wasDataReceived )
 {
 	FStatus status = FStatus_Failed;
 	bool areThereNewPackets;
-	FQuadCommsPacket_t newPacket;
 	
-	// Assume there are new packets to be retrieved
+	FQuadCommsPacket_t newPacket;
+	FQuadCommsCmd_t    sortedPacketCmd;
+	
+	// Clear the output arguments, if they exist
+	if ( wasACKReceived )
+	{
+		*wasACKReceived  = false;
+	}
+	if ( wasDataReceived )
+	{
+		*wasDataReceived = false;
+	}
+	
+	// Assume there are new packets to be retrieved in the buffer
 	areThereNewPackets = true;
 
 	while ( areThereNewPackets )
 	{
 		// Check for a new packet, timeout of 0ms ( no wait )
-		status = _FQuadComms_GetNextReceivedPacket( &newPacket, 0 );
+		status = _FQuadComms_GetNextReceivedPacket( &newPacket );
 		
 		// If a packet was received, sort it
 		if ( status == FStatus_Success )
 		{			
-			status = _FQuadComms_SortPacket( newPacket.frameData, newPacket.frameLength );
+			status = _FQuadComms_SortPacket( newPacket.frameData, newPacket.frameLength, &sortedPacketCmd );
 			require_noerr( status, exit );
+			
+			if (( sortedPacketCmd == FQuadCommsCmd_TXStatus ) && ( wasACKReceived != NULL ))
+			{
+				*wasACKReceived = true;
+			} 
+			else if (( sortedPacketCmd == FQuadCommsCmd_RX64Bit ) && ( wasDataReceived != NULL ))
+			{
+				*wasDataReceived = true;
+			}
 		}
 		else
 		{
@@ -390,7 +437,7 @@ exit:
 	return status;
 }
 
-static FStatus _FQuadComms_SortPacket( uint8_t *const inFrameData, uint16_t inFrameLength )
+static FStatus _FQuadComms_SortPacket( uint8_t *const inFrameData, uint16_t inFrameLength, FQuadCommsCmd_t *const outSortedPacketCmd )
 {
 	FStatus status = FStatus_Failed;
 	
@@ -399,6 +446,7 @@ static FStatus _FQuadComms_SortPacket( uint8_t *const inFrameData, uint16_t inFr
 	
 	require_action( inFrameData, exit, status = FStatus_InvalidArgument );
 	require_action( inFrameLength, exit, status = FStatus_InvalidArgument );
+	require_action( outSortedPacketCmd, exit, status = FStatus_InvalidArgument );
 	
 	switch ( inFrameData[0] )
 	{
@@ -410,6 +458,7 @@ static FStatus _FQuadComms_SortPacket( uint8_t *const inFrameData, uint16_t inFr
 			mCommsInfoStruct.latestACKFrameID = txACKData->frameID;
 			mCommsInfoStruct.latestACKStatus  = txACKData->status;
 			
+			*outSortedPacketCmd = FQuadCommsCmd_TXStatus;
 			break;
 		}
 		case FQuadCommsCmd_RX64Bit:
@@ -424,12 +473,16 @@ static FStatus _FQuadComms_SortPacket( uint8_t *const inFrameData, uint16_t inFr
 				mCommsInfoStruct.latestYaw        = rxFrameData->data[3];
 				mCommsInfoStruct.latestThrust     = rxFrameData->data[4];
 				mCommsInfoStruct.latestFlightRSSI = rxFrameData->RSSI; // Since this packet should only be received by the flight side
+				
+				*outSortedPacketCmd = FQuadCommsCmd_RX64Bit;
 			}
 			else if ( rxFrameData->data[0] == FQuadCommsDataType_FlightStatus )
 			{
 				mCommsInfoStruct.latestBatteryLevel   = rxFrameData->data[1];
 				mCommsInfoStruct.latestFlightRSSI     = rxFrameData->data[2];
 				mCommsInfoStruct.latestControllerRSSI = rxFrameData->RSSI; // since this packet should only be received by the controller side
+				
+				*outSortedPacketCmd = FQuadCommsCmd_RX64Bit;
 			}
 			else
 			{
@@ -444,6 +497,47 @@ static FStatus _FQuadComms_SortPacket( uint8_t *const inFrameData, uint16_t inFr
 	}
 	
 	status = FStatus_Success;
+exit:
+	return status;
+}
+
+static FStatus _FQuadComms_WaitForAck( uint16_t inTimeoutMs )
+{
+	FStatus status;
+	bool ackReceived = false;
+	
+	uint64_t startTime;
+	uint64_t currentTime;
+	
+	status = PlatformTimer_GetTime( &currentTime );
+	require_noerr( status, exit );
+	
+	startTime = currentTime;
+	
+	// Check for ACK until timed out, or ACK received
+	while ( ( uint16_t )(( currentTime - startTime ) <= inTimeoutMs ) && !ackReceived )
+	{
+		status = _FQuadComms_RetrieveAndSortAllNewPackets( &ackReceived, NULL);
+		require_noerr( status, exit );
+		
+		if ( ackReceived )
+		{
+			// Ensure this ACK matches the current frame
+			if ( mCommsInfoStruct.latestACKFrameID == mCommsInfoStruct.lastFrameID )
+			{
+				ackReceived = true;
+			}
+			else
+			{
+				ackReceived = false;
+			}
+		} 
+		
+		status = PlatformTimer_GetTime( &currentTime );
+		require_noerr( status, exit );
+	}
+	
+	status = ( ackReceived ) ? FStatus_Success : FStatus_Failed;
 exit:
 	return status;
 }

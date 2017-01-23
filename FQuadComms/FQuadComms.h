@@ -23,8 +23,11 @@ FStatus FQuadComms_Init( const PlatformGPIO_t inSleepPin, FQuadCommsType_t inCom
 
 FStatus FQuadComms_SendControls( const FQuadAxisValue inPitch, const FQuadAxisValue inRoll, const FQuadAxisValue inYaw, const FQuadThrustValue inThrust );
 
-FStatus FQuadComms_ReceiveControls( FQuadAxisValue *const outPitch, FQuadAxisValue *const outRoll, FQuadAxisValue *const outYaw, FQuadThrustValue *const outThrust );
-
+FStatus FQuadComms_ReceiveControls( FQuadAxisValue *const   outPitch,
+									FQuadAxisValue *const   outRoll,
+									FQuadAxisValue *const   outYaw,
+									FQuadThrustValue *const outThrust,
+									const uint16_t          inTimeoutMs );
 // Battery, RSSI
 FStatus FQuadComms_ReceiveStatus( );
 
