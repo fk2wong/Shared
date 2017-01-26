@@ -24,9 +24,10 @@
 #define FQUADRF_START_BYTE ( 0x7E )
 #define FQUADRF_HEADER_BYTES ( 3 )
 #define FQUADRF_CHECKSUM_BYTES ( 1 )
-#define FQUADRF_OVERHEAD_BYTES ( FQUADRF_HEADER_BYTES + FQUADRF_CHECKSUM_BYTES )
-#define FQUADRF_MAX_FRAME_SIZE ( FQUADRF_MAX_MSG_DATA_LEN + 11 )
-#define FQUADRF_MAX_PACKET_SIZE ( FQUADRF_MAX_FRAME_SIZE + FQUADRF_OVERHEAD_BYTES )
+#define FQUADRF_PACKET_OVERHEAD_BYTES ( FQUADRF_HEADER_BYTES + FQUADRF_CHECKSUM_BYTES )
+#define FQUADRF_DATA_FRAME_OVERHEAD_BYTES ( 11 )
+#define FQUADRF_MAX_FRAME_SIZE ( FQUADRF_MAX_MSG_DATA_LEN + FQUADRF_DATA_FRAME_OVERHEAD_BYTES )
+#define FQUADRF_MAX_PACKET_SIZE ( FQUADRF_MAX_FRAME_SIZE + FQUADRF_PACKET_OVERHEAD_BYTES )
 
 #define FQUADRF_RX_MSG_NON_DATA_BYTES ( 10 )
 
@@ -79,20 +80,26 @@ typedef struct __attribute__ (( packed ))
 	uint16_t frameLength;
 	uint8_t  frameData[FQUADRF_MAX_FRAME_SIZE];
 	uint8_t  checksum;
-} FQuadCommsPacket_t;
+} FQuadRFPacket_t;
 
 typedef struct 
 {
 	bool                isInitialized;
 	PlatformGPIO_t      sleepPin;
 	PlatformRingBuffer *uartBuffer;
+	
+	// For managing ring buffer data and scheduling callbacks
+	uint8_t bytesLeftInPacket;
+	
+	// Callback info
+	
 } FQuadRFInfo_t;
 
 static FQuadRFInfo_t mRFInfoStruct;
 
 static FStatus _FQuadRF_GetChecksum( void *const inFrameData, size_t inFrameLen, uint8_t *const outChecksum );
-static FStatus _FQuadRF_SerializePacket( FQuadCommsPacket_t *const outPacket, void *const inFrameData, size_t inFrameLen );
-static FStatus _FQuadRF_SendPacket( FQuadCommsPacket_t *const inPacket );
+static FStatus _FQuadRF_SerializePacket( FQuadRFPacket_t *const outPacket, void *const inFrameData, size_t inFrameLen );
+static FStatus _FQuadRF_SendPacket( FQuadRFPacket_t *const inPacket );
 
 FStatus FQuadRF_Init( const PlatformGPIO_t inSleepPin )
 {
@@ -117,6 +124,10 @@ FStatus FQuadRF_Init( const PlatformGPIO_t inSleepPin )
 	// Save sleep pin info
 	mRFInfoStruct.sleepPin = inSleepPin;
 	
+	// Indicate we are not waiting for any bytes in an ongoing packet RX transmission
+	mRFInfoStruct.bytesLeftInPacket = 0;
+	
+	// Initialization complete
 	mRFInfoStruct.isInitialized = true;
 	
 	status = FStatus_Success;
@@ -133,7 +144,7 @@ FStatus FQuadRF_SendMessage( const uint8_t *const inData,
 	FStatus                 status = FStatus_Failed;
 	FQuadRFTXFrameData_t txFrameData;
 	size_t                  txFrameLength;
-	FQuadCommsPacket_t      txPacket;
+	FQuadRFPacket_t      txPacket;
 	
 	require_action( inData, exit, status = FStatus_InvalidArgument );
 	require_action( inDataLen != 0, exit, status = FStatus_InvalidArgument );
@@ -163,7 +174,7 @@ exit:
 	return status;
 }
 
-static FStatus _FQuadRF_SerializePacket( FQuadCommsPacket_t *const outPacket, void *const inFrameData, size_t inFrameLen )
+static FStatus _FQuadRF_SerializePacket( FQuadRFPacket_t *const outPacket, void *const inFrameData, size_t inFrameLen )
 {
 	FStatus status = FStatus_Failed;
 	
@@ -207,7 +218,7 @@ exit:
 	return status;
 }
 
-static FStatus _FQuadRF_SendPacket( FQuadCommsPacket_t *const inPacket )
+static FStatus _FQuadRF_SendPacket( FQuadRFPacket_t *const inPacket )
 {
 	FStatus status = FStatus_Failed;
 	PlatformStatus platformStatus;
@@ -246,7 +257,7 @@ FStatus FQuadRF_ReceiveMessage( uint8_t *const outData, uint8_t *const outDataLe
 	uint16_t packetLength;
 	uint16_t frameLengthRaw;
 	
-	FQuadCommsPacket_t *rawPacket;
+	FQuadRFPacket_t *rawPacket;
 	
 	FQuadRFRXFrameData_t *rawRXData;
 	FQuadRFTXACKData_t   *rawTXStatusData;
@@ -267,7 +278,7 @@ FStatus FQuadRF_ReceiveMessage( uint8_t *const outData, uint8_t *const outDataLe
 	
 	// Find the remaining packet length
 	frameLengthRaw = *( uint16_t* )&rawData[1];
-	packetLength   = NTOHS( frameLengthRaw ) + FQUADRF_OVERHEAD_BYTES;
+	packetLength   = NTOHS( frameLengthRaw ) + FQUADRF_PACKET_OVERHEAD_BYTES;
 	
 	// Get the rest of the packet, which is the frame + checksum
 	platformStatus = PlatformUART_Receive( &rawData[FQUADRF_HEADER_BYTES], packetLength - FQUADRF_HEADER_BYTES );
@@ -285,7 +296,7 @@ FStatus FQuadRF_ReceiveMessage( uint8_t *const outData, uint8_t *const outDataLe
 	}
 	
 	// Check the checksum of the frame (don't include checksum byte in the checksum)
-	_FQuadRF_GetChecksum( &rawData[FQUADRF_HEADER_BYTES], packetLength - FQUADRF_OVERHEAD_BYTES, &calculatedChecksum );
+	_FQuadRF_GetChecksum( &rawData[FQUADRF_HEADER_BYTES], packetLength - FQUADRF_PACKET_OVERHEAD_BYTES, &calculatedChecksum );
 	
 	// Check the checksum matches what we received
 	require( calculatedChecksum == rawData[ FQUADRF_HEADER_BYTES + packetLength ], exit );
@@ -296,7 +307,7 @@ FStatus FQuadRF_ReceiveMessage( uint8_t *const outData, uint8_t *const outDataLe
 	if ( *outCmdID == FQuadRFCmd_TXStatus )
 	{
 		// Cast the raw data into packet structure for easier access
-		rawPacket       = ( FQuadCommsPacket_t* ) rawData;
+		rawPacket       = ( FQuadRFPacket_t* ) rawData;
 		rawTXStatusData = ( FQuadRFTXACKData_t* ) rawPacket->frameData;
 		
 		// Cast output data to the appropriate type
@@ -309,7 +320,7 @@ FStatus FQuadRF_ReceiveMessage( uint8_t *const outData, uint8_t *const outDataLe
 	else if ( *outCmdID == FQuadRFCmd_RX64Bit )
 	{
 		// Cast the raw data into packet structure for easier access
-		rawPacket = ( FQuadCommsPacket_t* ) rawData;
+		rawPacket = ( FQuadRFPacket_t* ) rawData;
 		rawRXData = ( FQuadRFRXFrameData_t* ) rawPacket->frameData;
 				
 		// Cast output data to the appropriate type
@@ -352,4 +363,102 @@ FStatus FQuadRF_Sleep()
 	platformStatus = PlatformGPIO_OutputHigh( mRFInfoStruct.sleepPin );
 	
 	return ( platformStatus == PlatformStatus_Success ) ? FStatus_Success : FStatus_Failed;
+}
+
+PlatformRingBuffer_DataReceivedISR FQuadRF_ByteReceivedISR( PlatformRingBuffer *const inRingBuffer,
+                                                            const uint8_t* const      inDataReceived,
+                                                            const size_t              inDataLen,
+                                                            const size_t              inBufferBytesUsed )
+{
+	// NOTE: This should only be called with a data length of one, 
+	// since the only source writing to the ring buffer is the UART,
+	// which is one byte at a time.
+	PlatformStatus status;
+	uint8_t data[FQUADRF_MAX_PACKET_SIZE];
+	uint16_t rawLength;
+	
+	require_quiet( inRingBuffer, exit );
+	require_quiet( inDataReceived, exit );
+	require_quiet( inDataLen == 1, exit );
+	
+	// If this is the start of a new packet ( there are no more bytes in the previous packet, and we received a new byte )
+	if ( mRFInfoStruct.bytesLeftInPacket == 0 )
+	{
+		// If this is the first byte in the packet, then ensure this is the start byte. 
+		// If not, something went wrong, so flush until we receive it.
+		if ( inBufferBytesUsed == 1 )
+		{
+			if ( *inDataReceived != FQUADRF_START_BYTE )
+			{
+				status = PlatformRingBuffer_Consume( inRingBuffer, 1 );
+				require_noerr_quiet( status, exit );
+			}
+		}
+		
+		// If we have the complete header, we will know how much data is left in the packet.
+		if ( inBufferBytesUsed == FQUADRF_HEADER_BYTES )
+		{
+			// Peek the header
+			status = PlatformRingBuffer_Peek( inRingBuffer, data, FQUADRF_HEADER_BYTES );
+			require_noerr_quiet( status, exit );
+			
+			// Get the length of the packet's frame
+			rawLength = ( data[1] << 8 ) | data[2];
+			
+			mRFInfoStruct.bytesLeftInPacket = NTOHS( rawLength ) + FQUADRF_CHECKSUM_BYTES;
+		}
+	}
+	// Otherwise we are waiting for bytes in the packet, after a header has already been received. 
+	// Decrement the number of bytes we are waiting for. 
+	else
+	{
+		mRFInfoStruct.bytesLeftInPacket--;
+		
+		// If the packet is now complete, package the relevant data and send it to upper layers.
+		if ( mRFInfoStruct.bytesLeftInPacket == 0 )
+		{
+			status = PlatformRingBuffer_ReadBuffer( inRingBuffer, data, inBufferBytesUsed );
+			require_noerr_quiet( status, exit );
+			
+			status = _FQuadRF_ExtractDataAndSendCallback( data, inBufferBytesUsed );
+		}
+	}
+	
+exit:
+	return;
+}
+
+static FStatus _FQuadRF_ExtractDataAndSendCallback( uint8_t *const inData, const size_t inDataLen )
+{
+	FStatus status = FStatus_Failed;
+	
+	FQuadRFPacket_t *rawPacket;
+	FQuadRFRXFrameData_t *rxFrame;
+	FQuadRFTXACKData_t   *ackFrame;
+	
+	// Cast raw data into packet
+	rawPacket = ( FQuadRFPacket_t* )data;
+	
+	// Determine the type of packet
+	switch ( rawPacket->frameData[0] )
+	{
+		case FQuadRFCmd_TXStatus:
+		{
+			// Cast frame to ACK frame
+			ackFrame = ( FQuadRFTXACKData_t* ) rawPacket->frameData;
+			
+			// Call the registered ack received ISR
+			mRFInfoStruct.ackReceivedISR( ackFrame->frameID, ackFrame->status );
+			break;
+		}
+		case FQuadRFCmd_RX64Bit:
+		{
+			// Cast frame to RX Frame
+			rxFrame = ( FQuadRFRXFrameData_t* ) rawPacket->frameData;
+			
+			// Call the registered msg received ISR
+			mRFInfoStruct.msgReceivedISR( rxFrame->data, inDataLen - FQUADRF_DATA_FRAME_OVERHEAD_BYTES - FQUADRF_PACKET_OVERHEAD_BYTES, rxFrame->RSSI );
+			break;
+		}
+	}
 }
