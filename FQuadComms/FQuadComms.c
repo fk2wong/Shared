@@ -6,39 +6,23 @@
  */ 
 
 #include "FQuadComms.h"
+#include "FQuadRF.h"
 #include "require_macros.h"
 #include "Platform_FQuadTX.h"
 #include <stdbool.h>
 #include <string.h>
 #include <util/delay.h>
 
-#define FQUAD_COMMS_UART_BAUD_RATE        ( 19200 )
-#define FQUAD_COMMS_UART_RING_BUFFER_SIZE ( 64 )
-
-#define UART_BITS_PER_BYTE                ( 10 )
-#define FQUAD_MAX_PACKET_SEND_TIME_MS     (( uint16_t )((( uint32_t )UART_BITS_PER_BYTE * FQUAD_COMMS_MAX_PACKET_SIZE * 1000 ) / ( FQUAD_COMMS_UART_BAUD_RATE )))
-
-#define FQUAD_COMMS_CONTROLS_LEN          ( 4 )
-#define FQUAD_COMMS_FLIGHT_STATUS_LEN     ( 1 )
-#define FQUAD_COMMS_DATA_TYPE_ID_LEN      ( 1 )
-#define FQUAD_COMMS_MAX_TX_DATA_LEN       ( MAX( FQUAD_COMMS_CONTROLS_LEN, FQUAD_COMMS_FLIGHT_STATUS_LEN ) + FQUAD_COMMS_DATA_TYPE_ID_LEN )     
-#define FQUAD_COMMS_HEADER_BYTES          ( 3 )
-#define FQUAD_COMMS_CHECKSUM_BYTES        ( 1 ) 
-#define FQUAD_COMMS_OVERHEAD_BYTES        ( FQUAD_COMMS_HEADER_BYTES + FQUAD_COMMS_CHECKSUM_BYTES )
-#define FQUAD_COMMS_ACK_LENGTH_BYTES      ( 3 ) 
-#define FQUAD_COMMS_MAX_FRAME_DATA_LEN    ( 11 + FQUAD_COMMS_MAX_TX_DATA_LEN )
-#define FQUAD_COMMS_MAX_PACKET_SIZE       ( FQUAD_COMMS_OVERHEAD_BYTES + FQUAD_COMMS_MAX_FRAME_DATA_LEN ) 
-
-#define FQUAD_COMMS_START_BYTE ( 0x7E )
-
-#define FQUAD_COMMS_START_FRAME_ID ( 1 )
-
-#define FQUAD_COMMS_WAKE_TIME_MS ( 4 )
+#define FQUAD_COMMS_CONTROLS_MSG_LEN ( 5 )
+#define FQUAD_COMMS_FLIGHT_STATUS_MSG_LEN ( 3 )
+#define FQUAD_COMMS_MAX_MSG_LEN      ( 5 )
 
 #define FQUAD_ADDRH   ( 0x13A200 )
 #define FQUAD_ADDRL   ( 0x40B39D9C )
 #define FQUADTX_ADDRH ( 0x13A200 )
 #define FQUADTX_ADDRL ( 0x40B39D9D )
+
+#define FQUAD_COMMS_START_FRAME_ID ( 1 )
 
 #define FQUAD_COMMS_ACK_TIMEOUT_MS ( 1000 ) // XBee Datasheet: (200 + 48ms wait) * 4
 
@@ -46,9 +30,6 @@ typedef struct
 {
 	bool                isInitialized;
 	
-	PlatformGPIO_t      sleepPin;
-	
-	PlatformRingBuffer *uartBuffer;
 	uint8_t             lastFrameID;
 	
 	FQuadAxisValue      latestPitch;
@@ -65,85 +46,16 @@ typedef struct
 	
 } FQuadCommsInfoStruct_t;
 
-F_ENUM( uint8_t, FQuadCommsCmd_t )
-{
-	FQuadCommsCmd_TX64Bit  = 0x00,
-	FQuadCommsCmd_TXStatus = 0x89,
-	FQuadCommsCmd_RX64Bit  = 0x80,
-};
-
 F_ENUM( uint8_t, FQuadCommsDataType_t )
 {
 	FQuadCommsDataType_Controls,
 	FQuadCommsDataType_FlightStatus,
 };
 
-F_ENUM( uint8_t, FQuadCommsTXOptions )
-{
-	FQuadCommsTXOptions_None           = 0x00,
-	FQuadCommsTXOptions_DisableACK     = 0x01,
-	FQuadCommsTXOptions_BroadcastPanID = 0x04,
-};
-
-F_ENUM( uint8_t, FQuadCommsRXOptions )
-{
-	FQuadCommsRXOptions_None             = 0x00,
-	FQuadCommsRXOptions_AddressBroadcast = 0x02,
-	FQuadCommsRXOptions_PanBroadcast     = 0x04,
-};
-
-F_ENUM( uint8_t, FQuadCommsTXStatus )
-{
-	FQuadCommsTXStatus_Success = 0,
-	FQuadCommsTXStatus_NACK    = 1,
-	FQuadCommsTXStatus_CCAFail = 2,
-	FQuadCommsTXStatus_Purged  = 3,
-};
-
-typedef struct __attribute__ (( packed ))
-{
-	FQuadCommsCmd_t     cmd;  
-	uint32_t            sourceADDRH;
-	uint32_t            sourceADDRL;
-	int8_t              RSSI;
-	FQuadCommsRXOptions options;
-	uint8_t             data[FQUAD_COMMS_MAX_TX_DATA_LEN];
-} FQuadCommsRXFrameData_t;
-
-typedef struct __attribute__ (( packed ))
-{
-	FQuadCommsCmd_t     cmd;
-	uint8_t             frameID;
-	uint32_t            destADDRH;
-	uint32_t            destADDRL;
-	FQuadCommsTXOptions options;
-	uint8_t             data[FQUAD_COMMS_MAX_TX_DATA_LEN];
-} FQuadCommsTXFrameData_t;
-
-typedef struct __attribute__ (( packed ))
-{
-	FQuadCommsCmd_t    cmd;
-	uint8_t            frameID;
-	FQuadCommsTXStatus status;
-} FQuadCommsTXACKData_t;
-
-typedef struct __attribute__ (( packed ))
-{
-	uint8_t  startByte;
-	uint16_t frameLength;
-	uint8_t  frameData[FQUAD_COMMS_MAX_FRAME_DATA_LEN];
-	uint8_t  checksum;
-} FQuadCommsPacket_t;
-
 static FQuadCommsInfoStruct_t mCommsInfoStruct;
 
-
-static FStatus _FQuadComms_SerializePacket( FQuadCommsPacket_t *const outPacket, void *const inData, size_t inDataLen );
-static FStatus _FQuadComms_GetChecksum(  void *const inData, size_t inDataLen, uint8_t *const outChecksum );
-static FStatus _FQuadComms_SendPacket( FQuadCommsPacket_t *const inPacket );
-
 static FStatus _FQuadComms_RetrieveAndSortAllNewPackets( bool *const wasACKReceived, bool *const wasDataReceived );
-static FStatus _FQuadComms_SortPacket( uint8_t *const inFrameData, uint16_t inFrameLength, FQuadCommsCmd_t *const outSortedPacketCmd );
+static FStatus _FQuadComms_SortMessage( uint8_t *const inData, uint16_t inDataLength, FQuadRFCmdID_t inCmdID );
 static FStatus _FQuadComms_WaitForAck( uint16_t inTimeoutMs );
 
 FStatus FQuadComms_Init( const PlatformGPIO_t inSleepPin )
@@ -154,21 +66,6 @@ FStatus FQuadComms_Init( const PlatformGPIO_t inSleepPin )
 	// Check if already initialized
 	require_action( !mCommsInfoStruct.isInitialized, exit, status = FStatus_AlreadyInitialized );
 	
-	// Initialize ring buffer for UART
-	mCommsInfoStruct.uartBuffer = PlatformRingBuffer_Create( FQUAD_COMMS_UART_RING_BUFFER_SIZE );
-	require( mCommsInfoStruct.uartBuffer, exit );
-	
-	// Initialize UART with ring buffer
-	platformStatus = PlatformUART_Init( FQUAD_COMMS_UART_BAUD_RATE, mCommsInfoStruct.uartBuffer );
-	require_noerr( platformStatus, exit );
-	
-	// Configure sleep pin, deasserted
-	platformStatus = PlatformGPIO_Configure( inSleepPin, PlatformGPIOConfig_Output );
-	require_noerr( platformStatus, exit );
-	
-	platformStatus = PlatformGPIO_OutputLow( inSleepPin );
-	require_noerr( platformStatus, exit );
-	
 	// Initialize timer for timeouts. May be already intialized by other modules.
 	platformStatus = PlatformTimer_Init();
 	require(( platformStatus == PlatformStatus_Success ) || ( platformStatus == PlatformStatus_AlreadyInitialized ), exit );
@@ -176,9 +73,6 @@ FStatus FQuadComms_Init( const PlatformGPIO_t inSleepPin )
 	// Initialize frame IDs, for matching ACKs
 	mCommsInfoStruct.lastFrameID      = FQUAD_COMMS_START_FRAME_ID;
 	mCommsInfoStruct.latestACKFrameID = FQUAD_COMMS_START_FRAME_ID - 1;
-	
-	// Save sleep pin info
-	mCommsInfoStruct.sleepPin = inSleepPin;
 	
 	mCommsInfoStruct.isInitialized = true;
 	
@@ -190,27 +84,17 @@ exit:
 FStatus FQuadComms_SendControls( const FQuadAxisValue inPitch, const FQuadAxisValue inRoll, const FQuadAxisValue inYaw, const FQuadThrustValue inThrust )
 {
 	FStatus status = FStatus_Failed;
-	FQuadCommsTXFrameData_t txCmdData;
-	FQuadCommsPacket_t      txPacket;
+	uint8_t msgData[FQUAD_COMMS_CONTROLS_MSG_LEN];
 	
-	// Fill TX command specific data
-	txCmdData.cmd       = FQuadCommsCmd_TX64Bit;
-	txCmdData.frameID   = ++mCommsInfoStruct.lastFrameID;
-	txCmdData.destADDRH = HTONL( FQUAD_ADDRH );
-	txCmdData.destADDRL = HTONL( FQUAD_ADDRL );
-	txCmdData.data[0]   = FQuadCommsDataType_Controls;
-	txCmdData.data[1]   = inPitch;
-	txCmdData.data[2]   = inRoll;
-	txCmdData.data[3]   = inYaw;
-	txCmdData.data[4]   = inThrust;
-	txCmdData.options   = FQuadCommsTXOptions_None;
+	// Structure the data into a message, with the first byte as the type of message 
+	msgData[0] = FQuadCommsDataType_Controls;
+	msgData[1] = inPitch;
+	msgData[2] = inRoll;
+	msgData[3] = inYaw;
+	msgData[4] = inThrust;
 	
-	// Create packet
-	status = _FQuadComms_SerializePacket( &txPacket, &txCmdData, sizeof( FQuadCommsTXFrameData_t ));
-	require_noerr( status, exit );
-	
-	// Send the packet
-	status = _FQuadComms_SendPacket( &txPacket );
+	// Send message
+	status = FQuadRF_SendMessage( msgData, sizeof( msgData ), ++mCommsInfoStruct.lastFrameID, HTONL( FQUAD_ADDRH ), HTONL( FQUAD_ADDRL ));
 	require_noerr( status, exit );
 	
 	// Wait for ACK
@@ -225,25 +109,15 @@ exit:
 FStatus FQuadComms_SendFlightBatteryLevelAndRSSI( const FQuadBatteryLevel inBatteryLevel, const FQuadRSSI inFlightRSSI )
 {
 	FStatus status = FStatus_Failed;
-	FQuadCommsTXFrameData_t txCmdData;
-	FQuadCommsPacket_t      txPacket;
+	uint8_t msgData[FQUAD_COMMS_FLIGHT_STATUS_MSG_LEN];
 	
-	// Fill TX command specific data
-	txCmdData.cmd       = FQuadCommsCmd_TX64Bit;
-	txCmdData.frameID   = ++mCommsInfoStruct.lastFrameID;
-	txCmdData.destADDRH = HTONL( FQUAD_ADDRH );
-	txCmdData.destADDRL = HTONL( FQUAD_ADDRL );
-	txCmdData.data[0]   = FQuadCommsDataType_FlightStatus;
-	txCmdData.data[1]   = inBatteryLevel;
-	txCmdData.data[2]   = inFlightRSSI;
-	txCmdData.options   = FQuadCommsTXOptions_None;
+	// Structure the data into a message, with the first byte as the type of message
+	msgData[0] = FQuadCommsDataType_FlightStatus;
+	msgData[1] = inBatteryLevel;
+	msgData[2] = inFlightRSSI;
 	
-	// Create packet
-	status = _FQuadComms_SerializePacket( &txPacket, &txCmdData, sizeof( FQuadCommsTXFrameData_t ));
-	require_noerr( status, exit );
-	
-	// Send the packet
-	status = _FQuadComms_SendPacket( &txPacket );
+	// Send message
+	status = FQuadRF_SendMessage( msgData, sizeof( msgData ), ++mCommsInfoStruct.lastFrameID, HTONL( FQUAD_ADDRH ), HTONL( FQUAD_ADDRL ));
 	require_noerr( status, exit );
 	
 	// Wait for ACK
@@ -330,159 +204,24 @@ exit:
 }
 
 FStatus FQuadComms_Sleep()
-{
-	PlatformStatus platformStatus;
-	
-	platformStatus = PlatformGPIO_OutputHigh( mCommsInfoStruct.sleepPin );
-	
-	return ( platformStatus == PlatformStatus_Success ) ? FStatus_Success : FStatus_Failed;
+{	
+	return FQuadRF_Sleep();
 }
 
 FStatus FQuadComms_Wake()
-{
-	PlatformStatus platformStatus;
-	
-	platformStatus = PlatformGPIO_OutputLow( mCommsInfoStruct.sleepPin );
-	
-	// Wait enough time for the module to exit sleep mode 
-	// TODO change this to timer?
-	_delay_ms( FQUAD_COMMS_WAKE_TIME_MS );
-	
-	return ( platformStatus == PlatformStatus_Success ) ? FStatus_Success : FStatus_Failed;
+{	
+	return FQuadRF_Wake();
 }
 
-static FStatus _FQuadComms_SerializePacket( FQuadCommsPacket_t *const outPacket, void *const inData, size_t inDataLen )
-{
-	FStatus status = FStatus_Failed;
-	
-	require_action( outPacket, exit, status = FStatus_InvalidArgument );
-	require_action( inData, exit , status = FStatus_InvalidArgument );
-	require_action( inDataLen, exit, status = FStatus_InvalidArgument );
-	
-	// Fill packet info
-	outPacket->startByte = FQUAD_COMMS_START_BYTE;
-	outPacket->frameLength    = HTONS( inDataLen );
-	memcpy( outPacket->frameData, inData, inDataLen ); 
-	
-	// Get packet checksum
-	status = _FQuadComms_GetChecksum( inData, inDataLen, &outPacket->checksum );
-	
-exit:
-	return status;	
-}
-
-static FStatus _FQuadComms_GetChecksum( void *const inFrameData, size_t inDataLen, uint8_t *const outChecksum )
-{
-	FStatus status = FStatus_Failed;
-	uint8_t checksum = 0;
-	
-	require_action( inFrameData, exit , status = FStatus_InvalidArgument );
-	require_action( inDataLen, exit, status = FStatus_InvalidArgument );
-	require_action( outChecksum, exit, status = FStatus_InvalidArgument );
-	
-	// Sum all the bytes
-	for ( uint8_t i = 0; i < inDataLen; i++ )
-	{
-		checksum += (( uint8_t* )inFrameData )[i];
-	}
-	
-	// Subtract from 0xFF
-	*outChecksum = 0xFF - checksum;
-	
-	status = FStatus_Success;
-exit:
-	return status;	
-}
-
-static FStatus _FQuadComms_SendPacket( FQuadCommsPacket_t *const inPacket )
-{
-	FStatus status = FStatus_Failed;
-	PlatformStatus platformStatus;
-	uint8_t header[FQUAD_COMMS_HEADER_BYTES];
-	
-	require_action( inPacket, exit, status = FStatus_InvalidArgument );
-	
-	// Send the packet header
-	memcpy( header, inPacket, FQUAD_COMMS_HEADER_BYTES );
-	
-	platformStatus = PlatformUART_Transmit( header, FQUAD_COMMS_HEADER_BYTES );
-	require_noerr( platformStatus, exit );
-	
-	// Send the command data
-	platformStatus = PlatformUART_Transmit( inPacket->frameData, inPacket->frameLength );
-	require_noerr( platformStatus, exit );
-	
-	// Send checksum
-	platformStatus = PlatformUART_Transmit( &inPacket->checksum, FQUAD_COMMS_CHECKSUM_BYTES );
-	require_noerr( platformStatus, exit );
-	
-	status = FStatus_Success;
-exit:
-	return status;
-}
-
-static FStatus _FQuadComms_GetNextReceivedPacket( FQuadCommsPacket_t *const outPacket )
-{
-	FStatus status = FStatus_Failed;
-	PlatformStatus platformStatus;
-	uint8_t rawData[FQUAD_COMMS_MAX_PACKET_SIZE];
-	uint8_t calculatedChecksum;
-	
-	uint16_t packetLength;
-	uint16_t frameLengthRaw;
-	
-	require_action( outPacket, exit, status = FStatus_InvalidArgument );
-	
-	// First get enough data to read the length of packet
-	platformStatus = PlatformUART_Receive( rawData, FQUAD_COMMS_HEADER_BYTES );
-	require( platformStatus, exit );
-		
-	// If we received something, the first byte should be a start byte, since nothing else is using the UART
-	require( rawData[0] == FQUAD_COMMS_START_BYTE, exit );
-			
-	// Find the remaining packet length
-	frameLengthRaw = *( uint16_t* )&rawData[1];
-	packetLength   = NTOHS( frameLengthRaw ) + FQUAD_COMMS_OVERHEAD_BYTES;
-			
-	// Get the rest of the packet, which is the frame + checksum
-	platformStatus = PlatformUART_Receive( &rawData[FQUAD_COMMS_HEADER_BYTES], packetLength - FQUAD_COMMS_HEADER_BYTES );
-	
-	// If the receive failed, then the packet may still be transmitting over UART. 
-	// Tr waiting a sufficient amount of time for the rest of the packet to be received
-	if ( platformStatus != PlatformStatus_Success )
-	{
-		// TODO change this to a timer function if keeping a delay?
-		_delay_ms( FQUAD_MAX_PACKET_SEND_TIME_MS * 2 );	
-		
-		// Try receiving again
-		platformStatus = PlatformUART_Receive( &rawData[FQUAD_COMMS_HEADER_BYTES], packetLength - FQUAD_COMMS_HEADER_BYTES );
-		require_noerr( platformStatus, exit );
-	}
-			
-	// Check the checksum of the frame (don't include checksum byte in the checksum)
-	_FQuadComms_GetChecksum( &rawData[FQUAD_COMMS_HEADER_BYTES], packetLength - FQUAD_COMMS_OVERHEAD_BYTES, &calculatedChecksum );
-			
-	// Check the checksum matches what we received
-	require( calculatedChecksum == rawData[ FQUAD_COMMS_HEADER_BYTES + packetLength ], exit );
-			
-	// Copy the data into the outPacket
-	outPacket->startByte   = rawData[0];
-	outPacket->frameLength = packetLength - FQUAD_COMMS_OVERHEAD_BYTES;
-	outPacket->checksum    = calculatedChecksum;
-	memcpy( outPacket->frameData, &rawData[FQUAD_COMMS_HEADER_BYTES], outPacket->frameLength );
-		
-	status = FStatus_Success;
-exit:
-	return status;
-}
 
 static FStatus _FQuadComms_RetrieveAndSortAllNewPackets( bool *const wasACKReceived, bool *const wasDataReceived )
 {
 	FStatus status = FStatus_Failed;
 	bool areThereNewPackets;
 	
-	FQuadCommsPacket_t newPacket;
-	FQuadCommsCmd_t    sortedPacketCmd;
+	uint8_t msgData[FQUAD_COMMS_MAX_MSG_LEN + 1];
+	uint8_t msgLen;
+	FQuadRFCmdID_t msgCmdID;
 	
 	// Clear the output arguments, if they exist
 	if ( wasACKReceived )
@@ -500,19 +239,20 @@ static FStatus _FQuadComms_RetrieveAndSortAllNewPackets( bool *const wasACKRecei
 	while ( areThereNewPackets )
 	{
 		// Check for a new packet, timeout of 0ms ( no wait )
-		status = _FQuadComms_GetNextReceivedPacket( &newPacket );
+		status = FQuadRF_ReceiveMessage( msgData, &msgLen, &msgCmdID );
 		
 		// If a packet was received, sort it
 		if ( status == FStatus_Success )
 		{			
-			status = _FQuadComms_SortPacket( newPacket.frameData, newPacket.frameLength, &sortedPacketCmd );
+			status = _FQuadComms_SortMessage( msgData, msgLen, msgCmdID );
 			require_noerr( status, exit );
 			
-			if (( sortedPacketCmd == FQuadCommsCmd_TXStatus ) && ( wasACKReceived != NULL ))
+			// Let the calling function know if a new ACK or if new data was received
+			if (( msgCmdID = FQuadRFCmd_TXStatus ) && ( wasACKReceived != NULL ))
 			{
 				*wasACKReceived = true;
-			} 
-			else if (( sortedPacketCmd == FQuadCommsCmd_RX64Bit ) && ( wasDataReceived != NULL ))
+			}
+			else if (( msgCmdID == FQuadRFCmd_RX64Bit ) && ( wasDataReceived != NULL ))
 			{
 				*wasDataReceived = true;
 			}
@@ -528,56 +268,49 @@ exit:
 	return status;
 }
 
-static FStatus _FQuadComms_SortPacket( uint8_t *const inFrameData, uint16_t inFrameLength, FQuadCommsCmd_t *const outSortedPacketCmd )
+static FStatus _FQuadComms_SortMessage( uint8_t *const inData, uint16_t inDataLength, FQuadRFCmdID_t inCmdID )
 {
 	FStatus status = FStatus_Failed;
 	
-	FQuadCommsRXFrameData_t *rxFrameData;
-	FQuadCommsTXACKData_t   *txACKData;
+	FQuadRFRXData_t   *rxData;
+	FQuadRFTXStatus_t *txACKData;
 	
-	require_action( inFrameData, exit, status = FStatus_InvalidArgument );
-	require_action( inFrameLength, exit, status = FStatus_InvalidArgument );
-	require_action( outSortedPacketCmd, exit, status = FStatus_InvalidArgument );
+	require_action( inData, exit, status = FStatus_InvalidArgument );
+	require_action( inDataLength, exit, status = FStatus_InvalidArgument );
 	
-	switch ( inFrameData[0] )
+	switch ( inCmdID )
 	{
 
-		case FQuadCommsCmd_TXStatus:
+		case FQuadRFCmd_TXStatus:
 		{
-			txACKData = ( FQuadCommsTXACKData_t* )inFrameData;
+			// Cast data to appropriate type
+			txACKData = ( FQuadRFTXStatus_t* )inData;
 			
+			// Save the frame ID and ACK status
 			mCommsInfoStruct.latestACKFrameID = txACKData->frameID;
 			mCommsInfoStruct.latestACKStatus  = txACKData->status;
 			
-			*outSortedPacketCmd = FQuadCommsCmd_TXStatus;
 			break;
 		}
-		case FQuadCommsCmd_RX64Bit:
+		case FQuadRFCmd_RX64Bit:
 		{
 			// Cast it to the RX Frame type
-			rxFrameData = ( FQuadCommsRXFrameData_t* )inFrameData;
+			rxData = ( FQuadRFRXData_t* )inData;
 			
-			if ( rxFrameData->data[0] == FQuadCommsDataType_Controls )
+			// Save the relevant data
+			if ( rxData->data[0] == FQuadCommsDataType_Controls )
 			{
-				mCommsInfoStruct.latestPitch      = rxFrameData->data[1];
-				mCommsInfoStruct.latestRoll       = rxFrameData->data[2];
-				mCommsInfoStruct.latestYaw        = rxFrameData->data[3];
-				mCommsInfoStruct.latestThrust     = rxFrameData->data[4];
-				mCommsInfoStruct.latestFlightRSSI = rxFrameData->RSSI; // Since this packet should only be received by the flight side
-				
-				*outSortedPacketCmd = FQuadCommsCmd_RX64Bit;
+				mCommsInfoStruct.latestPitch      = rxData->data[1];
+				mCommsInfoStruct.latestRoll       = rxData->data[2];
+				mCommsInfoStruct.latestYaw        = rxData->data[3];
+				mCommsInfoStruct.latestThrust     = rxData->data[4];
+				mCommsInfoStruct.latestFlightRSSI = rxData->RSSI; // Since this packet should only be received by the flight side
 			}
-			else if ( rxFrameData->data[0] == FQuadCommsDataType_FlightStatus )
+			else if ( rxData->data[0] == FQuadCommsDataType_FlightStatus )
 			{
-				mCommsInfoStruct.latestBatteryLevel   = rxFrameData->data[1];
-				mCommsInfoStruct.latestFlightRSSI     = rxFrameData->data[2];
-				mCommsInfoStruct.latestControllerRSSI = rxFrameData->RSSI; // since this packet should only be received by the controller side
-				
-				*outSortedPacketCmd = FQuadCommsCmd_RX64Bit;
-			}
-			else
-			{
-				goto exit;
+				mCommsInfoStruct.latestBatteryLevel   = rxData->data[1];
+				mCommsInfoStruct.latestFlightRSSI     = rxData->data[2];
+				mCommsInfoStruct.latestControllerRSSI = rxData->RSSI; // since this packet should only be received by the controller side
 			}
 			break;
 		}
@@ -596,6 +329,8 @@ static FStatus _FQuadComms_WaitForAck( uint16_t inTimeoutMs )
 {
 	FStatus status;
 	bool ackReceived = false;
+	bool ackMatches;
+	bool ackSuccess;
 	
 	uint64_t startTime;
 	uint64_t currentTime;
@@ -613,14 +348,12 @@ static FStatus _FQuadComms_WaitForAck( uint16_t inTimeoutMs )
 		
 		if ( ackReceived )
 		{
+			ackMatches = mCommsInfoStruct.latestACKFrameID == mCommsInfoStruct.lastFrameID;
+			ackSuccess = mCommsInfoStruct.latestACKStatus;
 			// Ensure this ACK matches the current frame
-			if ( mCommsInfoStruct.latestACKFrameID == mCommsInfoStruct.lastFrameID )
+			if ( ackMatches && ackSuccess )
 			{
 				ackReceived = true;
-			}
-			else
-			{
-				ackReceived = false;
 			}
 		} 
 		
