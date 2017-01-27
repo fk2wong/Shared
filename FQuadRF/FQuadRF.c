@@ -7,7 +7,9 @@
 
 #include "FQuadRF.h"
 #include "FUtilities.h"
-#include "Platform_FQuadTX.h"
+#include "PlatformRingBuffer.h"
+#include "PlatformUART.h"
+#include "PlatformClock.h"
 #include "require_macros.h"
 #include <util/delay.h>
 #include <stdlib.h>
@@ -18,8 +20,6 @@
 
 #define UART_BITS_PER_BYTE                ( 10 )
 #define FQUADRF_MAX_PACKET_SEND_TIME_MS     (( uint16_t )((( uint32_t )UART_BITS_PER_BYTE * FQUADRF_MAX_PACKET_SIZE * 1000 ) / ( FQUADRF_UART_BAUD_RATE )))
-
-
 
 #define FQUADRF_START_BYTE ( 0x7E )
 #define FQUADRF_HEADER_BYTES ( 3 )
@@ -32,6 +32,17 @@
 #define FQUADRF_RX_MSG_NON_DATA_BYTES ( 10 )
 
 #define FQUAD_COMMS_WAKE_TIME_MS ( 4 )
+
+//===============================//
+//           Typedefs            //
+//===============================//
+
+F_ENUM( uint8_t, FQuadRFCmdID_t )
+{
+	FQuadRFCmd_TX64Bit  = 0x00,
+	FQuadRFCmd_TXStatus = 0x89,
+	FQuadRFCmd_RX64Bit  = 0x80,
+};
 
 F_ENUM( uint8_t, FQuadRFTXOptions )
 {
@@ -53,7 +64,7 @@ typedef struct __attribute__ (( packed ))
 	uint32_t            sourceADDRH;
 	uint32_t            sourceADDRL;
 	int8_t              RSSI;
-	FQuadRFRXOptions options;
+	FQuadRFRXOptions    options;
 	uint8_t             data[FQUADRF_MAX_MSG_DATA_LEN];
 } FQuadRFRXFrameData_t;
 
@@ -63,15 +74,15 @@ typedef struct __attribute__ (( packed ))
 	uint8_t             frameID;
 	uint32_t            destADDRH;
 	uint32_t            destADDRL;
-	FQuadRFTXOptions options;
+	FQuadRFTXOptions    options;
 	uint8_t             data[FQUADRF_MAX_MSG_DATA_LEN];
 } FQuadRFTXFrameData_t;
 
 typedef struct __attribute__ (( packed ))
 {
-	FQuadRFCmdID_t     cmd;
-	uint8_t            frameID;
-	FQuadRFTXStatus status;
+	FQuadRFCmdID_t   cmd;
+	uint8_t          frameID;
+	FQuadRFTXStatus  status;
 } FQuadRFTXACKData_t;
 
 typedef struct __attribute__ (( packed ))
@@ -88,26 +99,48 @@ typedef struct
 	PlatformGPIO_t      sleepPin;
 	PlatformRingBuffer *uartBuffer;
 	
-	// For managing ring buffer data and scheduling callbacks
+	// For managing ring buffer data and assembling packets
 	uint8_t bytesLeftInPacket;
 	
 	// Callback info
+	FQuadRF_ACKReceivedISR ackReceivedISR;
+	FQuadRF_MsgReceivedISR msgReceivedISR;
 	
 } FQuadRFInfo_t;
 
 static FQuadRFInfo_t mRFInfoStruct;
 
+//================================//
+// Internal Function Declarations //
+//================================//
+
 static FStatus _FQuadRF_GetChecksum( void *const inFrameData, size_t inFrameLen, uint8_t *const outChecksum );
 static FStatus _FQuadRF_SerializePacket( FQuadRFPacket_t *const outPacket, void *const inFrameData, size_t inFrameLen );
 static FStatus _FQuadRF_SendPacket( FQuadRFPacket_t *const inPacket );
 
-FStatus FQuadRF_Init( const PlatformGPIO_t inSleepPin )
+void _FQuadRF_ByteReceivedISR( PlatformRingBuffer *const inRingBuffer,
+                                                             const uint8_t* const      inDataReceived,
+                                                             const size_t              inDataLen,
+                                                             const size_t              inBufferBytesUsed );
+															 
+static FStatus _FQuadRF_ExtractDataAndSendCallback( uint8_t *const inData, const size_t inDataLen );
+
+//=============================//
+// Public Function Definitions //
+//=============================//
+
+FStatus FQuadRF_Init( const PlatformGPIO_t inSleepPin, FQuadRF_MsgReceivedISR inMsgReceivedISR, FQuadRF_ACKReceivedISR inACKReceivedISR )
 {
 	FStatus status = FStatus_Failed;
 	PlatformStatus platformStatus;
 	
+	require_action( inMsgReceivedISR, exit, status = FStatus_InvalidArgument );
+	require_action( inACKReceivedISR, exit, status = FStatus_InvalidArgument );
+	
 	// Initialize ring buffer for UART
-	mRFInfoStruct.uartBuffer = PlatformRingBuffer_Create( FQUADRF_UART_RING_BUFFER_SIZE );
+	// We will get an ISR whenever a byte is received from the UART.
+	// In this ISR we will assemble the bytes into packets and callback the upper layer with relevant data.
+	mRFInfoStruct.uartBuffer = PlatformRingBuffer_Create( FQUADRF_UART_RING_BUFFER_SIZE, _FQuadRF_ByteReceivedISR );
 	require( mRFInfoStruct.uartBuffer, exit );
 		
 	// Initialize UART with ring buffer
@@ -123,6 +156,10 @@ FStatus FQuadRF_Init( const PlatformGPIO_t inSleepPin )
 	
 	// Save sleep pin info
 	mRFInfoStruct.sleepPin = inSleepPin;
+	
+	// Save callback info
+	mRFInfoStruct.msgReceivedISR = inMsgReceivedISR;
+	mRFInfoStruct.ackReceivedISR = inACKReceivedISR;
 	
 	// Indicate we are not waiting for any bytes in an ongoing packet RX transmission
 	mRFInfoStruct.bytesLeftInPacket = 0;
@@ -141,9 +178,9 @@ FStatus FQuadRF_SendMessage( const uint8_t *const inData,
 							 const uint32_t       inDestAddrH,
 							 const uint32_t       inDestAddrL )
 {
-	FStatus                 status = FStatus_Failed;
+	FStatus              status = FStatus_Failed;
 	FQuadRFTXFrameData_t txFrameData;
-	size_t                  txFrameLength;
+	size_t               txFrameLength;
 	FQuadRFPacket_t      txPacket;
 	
 	require_action( inData, exit, status = FStatus_InvalidArgument );
@@ -173,6 +210,32 @@ FStatus FQuadRF_SendMessage( const uint8_t *const inData,
 exit:
 	return status;
 }
+
+FStatus FQuadRF_Wake()
+{
+	PlatformStatus platformStatus;
+	
+	platformStatus = PlatformGPIO_OutputLow( mRFInfoStruct.sleepPin );
+	
+	// Wait enough time for the module to exit sleep mode
+	// TODO change this to timer?
+	_delay_ms( FQUAD_COMMS_WAKE_TIME_MS );
+	
+	return ( platformStatus == PlatformStatus_Success ) ? FStatus_Success : FStatus_Failed;
+}
+
+FStatus FQuadRF_Sleep()
+{
+	PlatformStatus platformStatus;
+	
+	platformStatus = PlatformGPIO_OutputHigh( mRFInfoStruct.sleepPin );
+	
+	return ( platformStatus == PlatformStatus_Success ) ? FStatus_Success : FStatus_Failed;
+}
+
+//===============================//
+// Internal Function Definitions //
+//===============================//
 
 static FStatus _FQuadRF_SerializePacket( FQuadRFPacket_t *const outPacket, void *const inFrameData, size_t inFrameLen )
 {
@@ -246,126 +309,7 @@ exit:
 	return status;
 }
 
-
-FStatus FQuadRF_ReceiveMessage( uint8_t *const outData, uint8_t *const outDataLen, FQuadRFCmdID_t *const outCmdID )
-{
-	FStatus status = FStatus_Failed;
-	PlatformStatus platformStatus;
-	uint8_t rawData[FQUADRF_MAX_PACKET_SIZE];
-	uint8_t calculatedChecksum;
-	
-	uint16_t packetLength;
-	uint16_t frameLengthRaw;
-	
-	FQuadRFPacket_t *rawPacket;
-	
-	FQuadRFRXFrameData_t *rawRXData;
-	FQuadRFTXACKData_t   *rawTXStatusData;
-	
-	FQuadRFTXStatus_t *txStatus;
-	FQuadRFRXData_t   *rxData;
-	
-	require_action( outData, exit, status = FStatus_InvalidArgument );
-	require_action( outDataLen, exit, status = FStatus_InvalidArgument );
-	require_action( outCmdID, exit, status = FStatus_InvalidArgument );
-	
-	// First get enough data to read the length of packet
-	platformStatus = PlatformUART_Receive( rawData, FQUADRF_HEADER_BYTES );
-	require( platformStatus, exit );
-	
-	// If we received something, the first byte should be a start byte, since nothing else is using the UART
-	require( rawData[0] == FQUADRF_START_BYTE, exit );
-	
-	// Find the remaining packet length
-	frameLengthRaw = *( uint16_t* )&rawData[1];
-	packetLength   = NTOHS( frameLengthRaw ) + FQUADRF_PACKET_OVERHEAD_BYTES;
-	
-	// Get the rest of the packet, which is the frame + checksum
-	platformStatus = PlatformUART_Receive( &rawData[FQUADRF_HEADER_BYTES], packetLength - FQUADRF_HEADER_BYTES );
-	
-	// If the receive failed, then the packet may still be transmitting over UART.
-	// Tr waiting a sufficient amount of time for the rest of the packet to be received
-	if ( platformStatus != PlatformStatus_Success )
-	{
-		// TODO change this to a timer function if keeping a delay?
-		_delay_ms( FQUADRF_MAX_PACKET_SEND_TIME_MS * 2 );
-		
-		// Try receiving again
-		platformStatus = PlatformUART_Receive( &rawData[FQUADRF_HEADER_BYTES], packetLength - FQUADRF_HEADER_BYTES );
-		require_noerr( platformStatus, exit );
-	}
-	
-	// Check the checksum of the frame (don't include checksum byte in the checksum)
-	_FQuadRF_GetChecksum( &rawData[FQUADRF_HEADER_BYTES], packetLength - FQUADRF_PACKET_OVERHEAD_BYTES, &calculatedChecksum );
-	
-	// Check the checksum matches what we received
-	require( calculatedChecksum == rawData[ FQUADRF_HEADER_BYTES + packetLength ], exit );
-	
-	// Return the relevant data to the upper layer
-	*outCmdID = rawData[FQUADRF_HEADER_BYTES];
-	
-	if ( *outCmdID == FQuadRFCmd_TXStatus )
-	{
-		// Cast the raw data into packet structure for easier access
-		rawPacket       = ( FQuadRFPacket_t* ) rawData;
-		rawTXStatusData = ( FQuadRFTXACKData_t* ) rawPacket->frameData;
-		
-		// Cast output data to the appropriate type
-		txStatus = ( FQuadRFTXStatus_t* ) outData;
-		
-		// Copy raw data into output
-		txStatus->frameID = rawTXStatusData->frameID;
-		txStatus->status  = rawTXStatusData->status;
-	}
-	else if ( *outCmdID == FQuadRFCmd_RX64Bit )
-	{
-		// Cast the raw data into packet structure for easier access
-		rawPacket = ( FQuadRFPacket_t* ) rawData;
-		rawRXData = ( FQuadRFRXFrameData_t* ) rawPacket->frameData;
-				
-		// Cast output data to the appropriate type
-		rxData = ( FQuadRFRXData_t* ) outData;
-				
-		// Copy RSSI into output
-		rxData->RSSI = rawRXData->RSSI;
-		
-		// Copy message data into output
-		memcpy( rxData->data, rawRXData->data, NTOHS( rawPacket->frameLength ) - FQUADRF_RX_MSG_NON_DATA_BYTES );
-	}
-	else
-	{
-		status = FStatus_Failed;
-		goto exit;
-	}
-	
-	status = FStatus_Success;
-exit:
-	return status;
-}
-
-FStatus FQuadRF_Wake()
-{
-	PlatformStatus platformStatus;
-	
-	platformStatus = PlatformGPIO_OutputLow( mRFInfoStruct.sleepPin );
-	
-	// Wait enough time for the module to exit sleep mode
-	// TODO change this to timer?
-	_delay_ms( FQUAD_COMMS_WAKE_TIME_MS );
-	
-	return ( platformStatus == PlatformStatus_Success ) ? FStatus_Success : FStatus_Failed;
-}
-
-FStatus FQuadRF_Sleep()
-{
-	PlatformStatus platformStatus;
-	
-	platformStatus = PlatformGPIO_OutputHigh( mRFInfoStruct.sleepPin );
-	
-	return ( platformStatus == PlatformStatus_Success ) ? FStatus_Success : FStatus_Failed;
-}
-
-PlatformRingBuffer_DataReceivedISR FQuadRF_ByteReceivedISR( PlatformRingBuffer *const inRingBuffer,
+void _FQuadRF_ByteReceivedISR( PlatformRingBuffer *const inRingBuffer,
                                                             const uint8_t* const      inDataReceived,
                                                             const size_t              inDataLen,
                                                             const size_t              inBufferBytesUsed )
@@ -385,7 +329,7 @@ PlatformRingBuffer_DataReceivedISR FQuadRF_ByteReceivedISR( PlatformRingBuffer *
 	if ( mRFInfoStruct.bytesLeftInPacket == 0 )
 	{
 		// If this is the first byte in the packet, then ensure this is the start byte. 
-		// If not, something went wrong, so flush until we receive it.
+		// If not, something went wrong, so flush this byte.
 		if ( inBufferBytesUsed == 1 )
 		{
 			if ( *inDataReceived != FQUADRF_START_BYTE )
@@ -409,9 +353,9 @@ PlatformRingBuffer_DataReceivedISR FQuadRF_ByteReceivedISR( PlatformRingBuffer *
 		}
 	}
 	// Otherwise we are waiting for bytes in the packet, after a header has already been received. 
-	// Decrement the number of bytes we are waiting for. 
 	else
 	{
+		// Decrement the number of bytes we are waiting for
 		mRFInfoStruct.bytesLeftInPacket--;
 		
 		// If the packet is now complete, package the relevant data and send it to upper layers.
@@ -421,6 +365,7 @@ PlatformRingBuffer_DataReceivedISR FQuadRF_ByteReceivedISR( PlatformRingBuffer *
 			require_noerr_quiet( status, exit );
 			
 			status = _FQuadRF_ExtractDataAndSendCallback( data, inBufferBytesUsed );
+			require_noerr_quiet( status, exit );
 		}
 	}
 	
@@ -436,8 +381,10 @@ static FStatus _FQuadRF_ExtractDataAndSendCallback( uint8_t *const inData, const
 	FQuadRFRXFrameData_t *rxFrame;
 	FQuadRFTXACKData_t   *ackFrame;
 	
+	require_action_quiet( inData, exit, status = FStatus_InvalidArgument );
+	
 	// Cast raw data into packet
-	rawPacket = ( FQuadRFPacket_t* )data;
+	rawPacket = ( FQuadRFPacket_t* )inData;
 	
 	// Determine the type of packet
 	switch ( rawPacket->frameData[0] )
@@ -461,4 +408,8 @@ static FStatus _FQuadRF_ExtractDataAndSendCallback( uint8_t *const inData, const
 			break;
 		}
 	}
+	
+	status = FStatus_Success;
+exit:
+	return status;
 }

@@ -33,14 +33,11 @@ FStatus FQuadComms_SendControls( const FQuadAxisValue inPitch, const FQuadAxisVa
 
 /*!
  *\brief    Receives controls from the controller.
- *
- *\param    inTimeoutMs - Time in milliseconds to wait for controls to be received.
  */
 FStatus FQuadComms_ReceiveControls( FQuadAxisValue *const   outPitch,
 									FQuadAxisValue *const   outRoll,
 									FQuadAxisValue *const   outYaw,
-									FQuadThrustValue *const outThrust,
-									const uint16_t          inTimeoutMs );
+									FQuadThrustValue *const outThrust );
 
 /*!
  *\brief    Sends the battery level and RSSI from the quadcopter to the controller.
@@ -60,11 +57,11 @@ FStatus FQuadComms_GetLatestFlightBatteryLevel( FQuadBatteryLevel *const outBatt
 /*!
  *\brief    Puts the RF chip into sleep mode.
  */	
-FStatus FQuadComms_Sleep();
+FStatus FQuadComms_Sleep( void );
 
 /*!
  *\brief    Wakes the RF chip from sleep mode.
  */	
-FStatus FQuadComms_Wake();
+FStatus FQuadComms_Wake( void );
 
 #endif /* FQUADCOMMS_H_ */

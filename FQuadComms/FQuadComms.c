@@ -26,11 +26,19 @@
 
 #define FQUAD_COMMS_ACK_TIMEOUT_MS ( 1000 ) // XBee Datasheet: (200 + 48ms wait) * 4
 
+//===============================//
+//           Typedefs            //
+//===============================//
+
+F_ENUM( uint8_t, FQuadCommsDataType_t )
+{
+	FQuadCommsDataType_Controls,
+	FQuadCommsDataType_FlightStatus,
+};
+
 typedef struct
 {
 	bool                isInitialized;
-	
-	uint8_t             lastFrameID;
 	
 	FQuadAxisValue      latestPitch;
 	FQuadAxisValue      latestRoll;
@@ -41,22 +49,50 @@ typedef struct
 	FQuadRSSI           latestFlightRSSI;
 	FQuadRSSI           latestControllerRSSI;
 	
-	uint8_t             latestACKFrameID;
+	uint8_t             lastFrameID;          // Keep track of the frame #, increments per msg.
 	uint8_t             latestACKStatus;
+	volatile bool       ackReceived;
 	
 } FQuadCommsInfoStruct_t;
 
-F_ENUM( uint8_t, FQuadCommsDataType_t )
+typedef struct
 {
-	FQuadCommsDataType_Controls,
-	FQuadCommsDataType_FlightStatus,
-};
+	FQuadAxisValue       pitch;
+	FQuadAxisValue       roll;
+	FQuadAxisValue       yaw;
+	FQuadThrustValue     thrust;
+} FQuadCommsControlsData_t;
+
+typedef struct
+{
+	FQuadBatteryLevel batteryLevel;
+	FQuadRSSI         RSSI;
+} FQuadCommsFlightStatusData_t;
+
+typedef struct __attribute__ (( packed ))
+{
+	FQuadCommsDataType_t type;
+	union
+	{
+		FQuadCommsControlsData_t     controls;
+		FQuadCommsFlightStatusData_t flightStatus;
+	};
+} FQuadCommsMsg_t;
 
 static FQuadCommsInfoStruct_t mCommsInfoStruct;
 
-static FStatus _FQuadComms_RetrieveAndSortAllNewPackets( bool *const wasACKReceived, bool *const wasDataReceived );
-static FStatus _FQuadComms_SortMessage( uint8_t *const inData, uint16_t inDataLength, FQuadRFCmdID_t inCmdID );
+//================================//
+// Internal Function Declarations //
+//================================//
+
 static FStatus _FQuadComms_WaitForAck( uint16_t inTimeoutMs );
+
+void _FQuadComms_ACKReceivedISR( const uint8_t inFrameID, const FQuadRFTXStatus inACKStatus );
+void _FQuadComms_MsgReceivedISR( uint8_t *const inMsg, const size_t inMsgLen, const FQuadRSSI inRSSI );
+
+//=============================//
+// Public Function Definitions //
+//=============================//
 
 FStatus FQuadComms_Init( const PlatformGPIO_t inSleepPin )
 {
@@ -66,14 +102,21 @@ FStatus FQuadComms_Init( const PlatformGPIO_t inSleepPin )
 	// Check if already initialized
 	require_action( !mCommsInfoStruct.isInitialized, exit, status = FStatus_AlreadyInitialized );
 	
+	// Initialize the RF module
+	platformStatus = FQuadRF_Init( inSleepPin, _FQuadComms_MsgReceivedISR, _FQuadComms_ACKReceivedISR );
+	require_noerr( platformStatus, exit );
+	
 	// Initialize timer for timeouts. May be already intialized by other modules.
 	platformStatus = PlatformTimer_Init();
 	require(( platformStatus == PlatformStatus_Success ) || ( platformStatus == PlatformStatus_AlreadyInitialized ), exit );
 	
 	// Initialize frame IDs, for matching ACKs
-	mCommsInfoStruct.lastFrameID      = FQUAD_COMMS_START_FRAME_ID;
-	mCommsInfoStruct.latestACKFrameID = FQUAD_COMMS_START_FRAME_ID - 1;
+	mCommsInfoStruct.lastFrameID = FQUAD_COMMS_START_FRAME_ID;
 	
+	// This must be initialized as zero, since it will act as binary semaphore when we wait for an ACK
+	mCommsInfoStruct.ackReceived = false;
+	
+	// Initialization complete
 	mCommsInfoStruct.isInitialized = true;
 	
 	status = FStatus_Success;
@@ -84,17 +127,23 @@ exit:
 FStatus FQuadComms_SendControls( const FQuadAxisValue inPitch, const FQuadAxisValue inRoll, const FQuadAxisValue inYaw, const FQuadThrustValue inThrust )
 {
 	FStatus status = FStatus_Failed;
-	uint8_t msgData[FQUAD_COMMS_CONTROLS_MSG_LEN];
+	FQuadCommsMsg_t msg;
+	
+	// Make sure the module is initialized
+	require_action( mCommsInfoStruct.isInitialized, exit, status = FStatus_NotInitialized );
 	
 	// Structure the data into a message, with the first byte as the type of message 
-	msgData[0] = FQuadCommsDataType_Controls;
-	msgData[1] = inPitch;
-	msgData[2] = inRoll;
-	msgData[3] = inYaw;
-	msgData[4] = inThrust;
+	msg.type            = FQuadCommsDataType_Controls;
+	msg.controls.pitch  = inPitch;
+	msg.controls.roll   = inRoll;
+	msg.controls.yaw    = inYaw;
+	msg.controls.thrust = inThrust;
+	
+	// Clear ACK status before we send the message
+	mCommsInfoStruct.ackReceived = false;
 	
 	// Send message
-	status = FQuadRF_SendMessage( msgData, sizeof( msgData ), ++mCommsInfoStruct.lastFrameID, HTONL( FQUAD_ADDRH ), HTONL( FQUAD_ADDRL ));
+	status = FQuadRF_SendMessage(( uint8_t* )&msg, FQUAD_COMMS_CONTROLS_MSG_LEN, ++mCommsInfoStruct.lastFrameID, HTONL( FQUAD_ADDRH ), HTONL( FQUAD_ADDRL ));
 	require_noerr( status, exit );
 	
 	// Wait for ACK
@@ -109,15 +158,21 @@ exit:
 FStatus FQuadComms_SendFlightBatteryLevelAndRSSI( const FQuadBatteryLevel inBatteryLevel, const FQuadRSSI inFlightRSSI )
 {
 	FStatus status = FStatus_Failed;
-	uint8_t msgData[FQUAD_COMMS_FLIGHT_STATUS_MSG_LEN];
+	FQuadCommsMsg_t msg;
+	
+	// Make sure the module is initialized
+	require_action( mCommsInfoStruct.isInitialized, exit, status = FStatus_NotInitialized );
 	
 	// Structure the data into a message, with the first byte as the type of message
-	msgData[0] = FQuadCommsDataType_FlightStatus;
-	msgData[1] = inBatteryLevel;
-	msgData[2] = inFlightRSSI;
+	msg.type                      = FQuadCommsDataType_FlightStatus;
+	msg.flightStatus.batteryLevel = inBatteryLevel;
+	msg.flightStatus.RSSI         = inFlightRSSI;
+
+	// Clear ACK status before we send the message
+	mCommsInfoStruct.ackReceived = false;
 	
 	// Send message
-	status = FQuadRF_SendMessage( msgData, sizeof( msgData ), ++mCommsInfoStruct.lastFrameID, HTONL( FQUAD_ADDRH ), HTONL( FQUAD_ADDRL ));
+	status = FQuadRF_SendMessage(( uint8_t* )&msg, FQUAD_COMMS_FLIGHT_STATUS_MSG_LEN, ++mCommsInfoStruct.lastFrameID, HTONL( FQUAD_ADDRH ), HTONL( FQUAD_ADDRL ));
 	require_noerr( status, exit );
 	
 	// Wait for ACK
@@ -131,39 +186,20 @@ exit:
 FStatus FQuadComms_ReceiveControls( FQuadAxisValue *const   outPitch, 
                                     FQuadAxisValue *const   outRoll, 
 									FQuadAxisValue *const   outYaw, 
-									FQuadThrustValue *const outThrust,
-									const uint16_t          inTimeoutMs )
+									FQuadThrustValue *const outThrust )
 {
-	FStatus status;
-	bool controlsReceived = false;
+	FStatus status = FStatus_InvalidArgument;
 	
-	uint64_t startTime;
-	uint64_t currentTime;
+	// Make sure the module is initialized
+	require_action( mCommsInfoStruct.isInitialized, exit, status = FStatus_NotInitialized );
 	
-	status = PlatformTimer_GetTime( &currentTime );
-	require_noerr( status, exit );
-	
-	startTime = currentTime;
-	
-	// Loop until controls received, or until timed out
-	while ( ( uint16_t )(( currentTime - startTime ) <= inTimeoutMs ) && !controlsReceived )
-	{
-		status = _FQuadComms_RetrieveAndSortAllNewPackets( NULL, &controlsReceived );
-		require_noerr( status, exit );
-		
-		if ( controlsReceived )
-		{
-			*outPitch  = mCommsInfoStruct.latestPitch;
-			*outRoll   = mCommsInfoStruct.latestRoll;
-			*outYaw    = mCommsInfoStruct.latestYaw;
-			*outThrust = mCommsInfoStruct.latestThrust;
-		}
-		
-		status = PlatformTimer_GetTime( &currentTime );
-		require_noerr( status, exit );
-	}
-	
-	status = ( controlsReceived ) ? FStatus_Success : FStatus_Failed;
+	// Output battery level
+	*outPitch   = mCommsInfoStruct.latestPitch;
+	*outRoll    = mCommsInfoStruct.latestRoll;
+	*outYaw     = mCommsInfoStruct.latestYaw;
+	*outThrust  = mCommsInfoStruct.latestThrust;
+
+	status = FStatus_Success;
 exit:
 	return status;
 }
@@ -172,23 +208,23 @@ FStatus FQuadComms_GetLatestFlightBatteryLevel( FQuadBatteryLevel *const outBatt
 {
 	FStatus status = FStatus_InvalidArgument;
 	
-	require( outBatteryLevel, exit );
-
-	status = _FQuadComms_RetrieveAndSortAllNewPackets( NULL, NULL );
-	require_noerr( status, exit );
+	// Make sure the module is initialized
+	require_action( mCommsInfoStruct.isInitialized, exit, status = FStatus_NotInitialized );
 	
+	// Output battery level
 	*outBatteryLevel  = mCommsInfoStruct.latestBatteryLevel;
 
+	status = FStatus_Success;
 exit:
 	return status;
 }
 
 FStatus FQuadComms_GetLatestRSSI( FQuadRSSI *const outControllerRSSI, FQuadRSSI *const outFlightRSSI )
 {
-	FStatus status;
-
-	status = _FQuadComms_RetrieveAndSortAllNewPackets( NULL, NULL );
-	require_noerr( status, exit );
+	FStatus status = FStatus_InvalidArgument;
+	
+	// Make sure the module is initialized
+	require_action( mCommsInfoStruct.isInitialized, exit, status = FStatus_NotInitialized );
 	
 	if ( outControllerRSSI != NULL )
 	{
@@ -199,169 +235,102 @@ FStatus FQuadComms_GetLatestRSSI( FQuadRSSI *const outControllerRSSI, FQuadRSSI 
 		*outFlightRSSI = mCommsInfoStruct.latestFlightRSSI;
 	}
 
+	status = FStatus_Success;
 exit:
 	return status;
 }
 
-FStatus FQuadComms_Sleep()
+inline FStatus FQuadComms_Sleep( void )
 {	
 	return FQuadRF_Sleep();
 }
 
-FStatus FQuadComms_Wake()
+inline FStatus FQuadComms_Wake( void )
 {	
 	return FQuadRF_Wake();
 }
 
-
-static FStatus _FQuadComms_RetrieveAndSortAllNewPackets( bool *const wasACKReceived, bool *const wasDataReceived )
-{
-	FStatus status = FStatus_Failed;
-	bool areThereNewPackets;
-	
-	uint8_t msgData[FQUAD_COMMS_MAX_MSG_LEN + 1];
-	uint8_t msgLen;
-	FQuadRFCmdID_t msgCmdID;
-	
-	// Clear the output arguments, if they exist
-	if ( wasACKReceived )
-	{
-		*wasACKReceived  = false;
-	}
-	if ( wasDataReceived )
-	{
-		*wasDataReceived = false;
-	}
-	
-	// Assume there are new packets to be retrieved in the buffer
-	areThereNewPackets = true;
-
-	while ( areThereNewPackets )
-	{
-		// Check for a new packet, timeout of 0ms ( no wait )
-		status = FQuadRF_ReceiveMessage( msgData, &msgLen, &msgCmdID );
-		
-		// If a packet was received, sort it
-		if ( status == FStatus_Success )
-		{			
-			status = _FQuadComms_SortMessage( msgData, msgLen, msgCmdID );
-			require_noerr( status, exit );
-			
-			// Let the calling function know if a new ACK or if new data was received
-			if (( msgCmdID = FQuadRFCmd_TXStatus ) && ( wasACKReceived != NULL ))
-			{
-				*wasACKReceived = true;
-			}
-			else if (( msgCmdID == FQuadRFCmd_RX64Bit ) && ( wasDataReceived != NULL ))
-			{
-				*wasDataReceived = true;
-			}
-		}
-		else
-		{
-			areThereNewPackets = false;
-		}
-	}
-	
-	status = FStatus_Success;
-exit:
-	return status;
-}
-
-static FStatus _FQuadComms_SortMessage( uint8_t *const inData, uint16_t inDataLength, FQuadRFCmdID_t inCmdID )
-{
-	FStatus status = FStatus_Failed;
-	
-	FQuadRFRXData_t   *rxData;
-	FQuadRFTXStatus_t *txACKData;
-	
-	require_action( inData, exit, status = FStatus_InvalidArgument );
-	require_action( inDataLength, exit, status = FStatus_InvalidArgument );
-	
-	switch ( inCmdID )
-	{
-
-		case FQuadRFCmd_TXStatus:
-		{
-			// Cast data to appropriate type
-			txACKData = ( FQuadRFTXStatus_t* )inData;
-			
-			// Save the frame ID and ACK status
-			mCommsInfoStruct.latestACKFrameID = txACKData->frameID;
-			mCommsInfoStruct.latestACKStatus  = txACKData->status;
-			
-			break;
-		}
-		case FQuadRFCmd_RX64Bit:
-		{
-			// Cast it to the RX Frame type
-			rxData = ( FQuadRFRXData_t* )inData;
-			
-			// Save the relevant data
-			if ( rxData->data[0] == FQuadCommsDataType_Controls )
-			{
-				mCommsInfoStruct.latestPitch      = rxData->data[1];
-				mCommsInfoStruct.latestRoll       = rxData->data[2];
-				mCommsInfoStruct.latestYaw        = rxData->data[3];
-				mCommsInfoStruct.latestThrust     = rxData->data[4];
-				mCommsInfoStruct.latestFlightRSSI = rxData->RSSI; // Since this packet should only be received by the flight side
-			}
-			else if ( rxData->data[0] == FQuadCommsDataType_FlightStatus )
-			{
-				mCommsInfoStruct.latestBatteryLevel   = rxData->data[1];
-				mCommsInfoStruct.latestFlightRSSI     = rxData->data[2];
-				mCommsInfoStruct.latestControllerRSSI = rxData->RSSI; // since this packet should only be received by the controller side
-			}
-			break;
-		}
-		default:
-		{
-			goto exit;
-		}
-	}
-	
-	status = FStatus_Success;
-exit:
-	return status;
-}
+//===============================//
+// Internal Function Definitions //
+//===============================//
 
 static FStatus _FQuadComms_WaitForAck( uint16_t inTimeoutMs )
 {
-	FStatus status;
-	bool ackReceived = false;
-	bool ackMatches;
-	bool ackSuccess;
+	FStatus status = FStatus_Failed;
+	PlatformStatus platformStatus;
 	
 	uint64_t startTime;
 	uint64_t currentTime;
 	
-	status = PlatformTimer_GetTime( &currentTime );
+	platformStatus = PlatformTimer_GetTime( &currentTime );
 	require_noerr( status, exit );
 	
 	startTime = currentTime;
 	
-	// Check for ACK until timed out, or ACK received
-	while ( ( uint16_t )(( currentTime - startTime ) <= inTimeoutMs ) && !ackReceived )
-	{
-		status = _FQuadComms_RetrieveAndSortAllNewPackets( &ackReceived, NULL);
-		require_noerr( status, exit );
-		
-		if ( ackReceived )
+	// Loop until timed out, or ACK received
+	while ( ( uint16_t )( currentTime - startTime ) <= inTimeoutMs )
+	{		
+		if ( mCommsInfoStruct.ackReceived )
 		{
-			ackMatches = mCommsInfoStruct.latestACKFrameID == mCommsInfoStruct.lastFrameID;
-			ackSuccess = mCommsInfoStruct.latestACKStatus;
-			// Ensure this ACK matches the current frame
-			if ( ackMatches && ackSuccess )
-			{
-				ackReceived = true;
-			}
+			// return status of the ACK
+			status = ( mCommsInfoStruct.latestACKStatus == FQuadRFTXStatus_Success ) ? FStatus_Success : FStatus_Failed;
+			
+			// Reset ackReceived flag
+			mCommsInfoStruct.ackReceived = false;
+			break;
 		} 
 		
-		status = PlatformTimer_GetTime( &currentTime );
-		require_noerr( status, exit );
+		// Check current time, for timeout purposes
+		platformStatus = PlatformTimer_GetTime( &currentTime );
+		require_noerr( platformStatus, exit );
 	}
 	
-	status = ( ackReceived ) ? FStatus_Success : FStatus_Failed;
 exit:
 	return status;
+}
+
+void _FQuadComms_MsgReceivedISR( uint8_t *const inMsg, const size_t inMsgLen, const FQuadRSSI inRSSI )
+{
+	FQuadCommsMsg_t *msg;
+	
+	require_noerr_quiet( inMsg, exit );
+	require_noerr_quiet( inMsgLen, exit );
+	
+	// Cast to appropriate type
+	msg = ( FQuadCommsMsg_t* )inMsg;
+	
+	switch ( msg->type )
+	{
+		case FQuadCommsDataType_Controls:
+		{
+			// Message sent from controller to flight
+			mCommsInfoStruct.latestPitch      = msg->controls.pitch;
+			mCommsInfoStruct.latestRoll       = msg->controls.roll;
+			mCommsInfoStruct.latestYaw        = msg->controls.yaw;
+			mCommsInfoStruct.latestThrust     = msg->controls.thrust;
+			mCommsInfoStruct.latestFlightRSSI = inRSSI;
+			
+			break;
+		}
+		case FQuadCommsDataType_FlightStatus:
+		{
+			// Message sent from flight to controller
+			mCommsInfoStruct.latestBatteryLevel   = msg->flightStatus.batteryLevel;
+			mCommsInfoStruct.latestFlightRSSI     = msg->flightStatus.RSSI;
+			mCommsInfoStruct.latestControllerRSSI = inRSSI;
+		}
+	}
+	
+exit:
+	return;
+}
+
+void _FQuadComms_ACKReceivedISR( const uint8_t inFrameID, const FQuadRFTXStatus inACKStatus )
+{
+	// If the ack frame matches the last one we sent
+	if ( mCommsInfoStruct.lastFrameID == inFrameID )
+	{
+		mCommsInfoStruct.latestACKStatus = inACKStatus;
+		mCommsInfoStruct.ackReceived     = true;
+	}
 }
