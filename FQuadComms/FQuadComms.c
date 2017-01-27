@@ -125,6 +125,7 @@ exit:
 }
 
 FStatus FQuadComms_SendControls( const FQuadAxisValue inPitch, const FQuadAxisValue inRoll, const FQuadAxisValue inYaw, const FQuadThrustValue inThrust )
+
 {
 	FStatus status = FStatus_Failed;
 	FQuadCommsMsg_t msg;
@@ -147,8 +148,8 @@ FStatus FQuadComms_SendControls( const FQuadAxisValue inPitch, const FQuadAxisVa
 	require_noerr( status, exit );
 	
 	// Wait for ACK
-	status = _FQuadComms_WaitForAck( FQUAD_COMMS_ACK_TIMEOUT_MS );
-	require_noerr( status, exit );
+	//status = _FQuadComms_WaitForAck( FQUAD_COMMS_ACK_TIMEOUT_MS );
+	//require_noerr( status, exit );
 	
 exit:
 	return status;

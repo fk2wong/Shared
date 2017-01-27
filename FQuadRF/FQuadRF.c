@@ -16,7 +16,7 @@
 #include <string.h>
 
 #define FQUADRF_UART_BAUD_RATE        ( 19200 )
-#define FQUADRF_UART_RING_BUFFER_SIZE ( 64 )
+#define FQUADRF_UART_RING_BUFFER_SIZE ( 32 )
 
 #define UART_BITS_PER_BYTE                ( 10 )
 #define FQUADRF_MAX_PACKET_SEND_TIME_MS     (( uint16_t )((( uint32_t )UART_BITS_PER_BYTE * FQUADRF_MAX_PACKET_SIZE * 1000 ) / ( FQUADRF_UART_BAUD_RATE )))
@@ -199,14 +199,19 @@ FStatus FQuadRF_SendMessage( const uint8_t *const inData,
 	// The length of the frame is the size of the struct , but using inDataLen instead of the array max size
 	txFrameLength = sizeof( FQuadRFTXFrameData_t ) - FQUADRF_MAX_MSG_DATA_LEN + inDataLen;
 	
+	PlatformUART_Transmit("here2\n", 6);
+	
 	// Create packet
 	status = _FQuadRF_SerializePacket( &txPacket, &txFrameData, txFrameLength );
 	require_noerr( status, exit );
+	
+	PlatformUART_Transmit((uint8_t*)&txPacket, sizeof(txPacket));
 	
 	// Send the packet
 	status = _FQuadRF_SendPacket( &txPacket );
 	require_noerr( status, exit );
 	
+	status = FStatus_Success;
 exit:
 	return status;
 }
@@ -245,6 +250,8 @@ static FStatus _FQuadRF_SerializePacket( FQuadRFPacket_t *const outPacket, void 
 	require_action( inFrameData, exit , status = FStatus_InvalidArgument );
 	require_action( inFrameLen, exit, status = FStatus_InvalidArgument );
 	
+	PlatformUART_Transmit("here3\n", 6);
+	
 	// Fill packet info
 	outPacket->startByte   = FQUADRF_START_BYTE;
 	outPacket->frameLength = HTONS( inFrameLen );
@@ -253,7 +260,6 @@ static FStatus _FQuadRF_SerializePacket( FQuadRFPacket_t *const outPacket, void 
 	
 	// Get packet checksum
 	status = _FQuadRF_GetChecksum( inFrameData, inFrameLen, &outPacket->checksum );
-	
 exit:
 	return status;
 }
@@ -262,14 +268,18 @@ static FStatus _FQuadRF_GetChecksum( void *const inFrameData, size_t inFrameLen,
 {
 	FStatus status = FStatus_Failed;
 	uint8_t checksum = 0;
+	uint8_t i;
 	
 	require_action( inFrameData, exit , status = FStatus_InvalidArgument );
 	require_action( inFrameLen, exit, status = FStatus_InvalidArgument );
 	require_action( outChecksum, exit, status = FStatus_InvalidArgument );
 	
+	PlatformUART_Transmit("here4\n", 6);
+	
 	// Sum all the bytes
-	for ( uint8_t i = 0; i < inFrameLen; i++ )
+	for ( i = 0; i < inFrameLen; i++ )
 	{
+		
 		checksum += (( uint8_t* )inFrameData )[i];
 	}
 	
@@ -297,7 +307,7 @@ static FStatus _FQuadRF_SendPacket( FQuadRFPacket_t *const inPacket )
 	require_noerr( platformStatus, exit );
 	
 	// Send the frame data
-	platformStatus = PlatformUART_Transmit(( uint8_t* )&inPacket->frameData, inPacket->frameLength );
+	platformStatus = PlatformUART_Transmit(( uint8_t* )&inPacket->frameData, NTOHS( inPacket->frameLength ));
 	require_noerr( platformStatus, exit );
 	
 	// Send checksum
