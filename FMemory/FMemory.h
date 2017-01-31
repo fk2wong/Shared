@@ -11,13 +11,18 @@
 
 #include <stdlib.h>
 #include <stddef.h>
+#include <stdint.h>
 
 // Public functions
 #define FMemoryAlloc( X )          malloc( X )
 #define FMemoryFreeAndNULLPtr( X ) _FMemoryFreeAndNULLPtr(( void** ) X )
 
+/*!
+ *\brief    Returns the number of free bytes left in RAM.
+ */
+int16_t FMemory_GetNumFreeBytes();
+
 // Should not be called explicitly
 void _FMemoryFreeAndNULLPtr( void** ioDoublePtr );
-
 
 #endif /* FMEMORY_H_ */

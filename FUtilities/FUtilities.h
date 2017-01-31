@@ -17,7 +17,7 @@
 #define MAX( X, Y )   ((( X ) > ( Y )) ? ( X ) : ( Y ))
 #define MIN( X, Y )   ((( X ) < ( Y )) ? ( X ) : ( Y ))
 
-#define HTONS( X ) (((( uint32_t )( X ) & 0xFF00 ) >> 8 ) | ((( uint32_t )( X ) & 0xFF ) << 8 ))  
+#define HTONS( X ) (((( uint16_t )( X ) & 0xFF00 ) >> 8 ) | ((( uint16_t )( X ) & 0xFF ) << 8 ))  
 #define HTONL( X ) (((( uint32_t )( X ) & 0xFF000000 ) >> 24 ) | \
 				   ((( uint32_t )( X ) & 0xFF0000 ) >> 8 ) | \
 				   ((( uint32_t )( X ) & 0xFF00 ) << 8 ) | \

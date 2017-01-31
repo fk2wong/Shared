@@ -22,7 +22,7 @@
 #define FQUADTX_ADDRH ( 0x13A200 )
 #define FQUADTX_ADDRL ( 0x40B39D9D )
 
-#define FQUAD_COMMS_START_FRAME_ID ( 1 )
+#define FQUAD_COMMS_START_FRAME_ID ( 0 )
 
 #define FQUAD_COMMS_ACK_TIMEOUT_MS ( 1000 ) // XBee Datasheet: (200 + 48ms wait) * 4
 
@@ -55,7 +55,7 @@ typedef struct
 	
 } FQuadCommsInfoStruct_t;
 
-typedef struct
+typedef struct __attribute__ (( packed ))
 {
 	FQuadAxisValue       pitch;
 	FQuadAxisValue       roll;
@@ -63,7 +63,7 @@ typedef struct
 	FQuadThrustValue     thrust;
 } FQuadCommsControlsData_t;
 
-typedef struct
+typedef struct __attribute__ (( packed ))
 {
 	FQuadBatteryLevel batteryLevel;
 	FQuadRSSI         RSSI;
@@ -76,7 +76,7 @@ typedef struct __attribute__ (( packed ))
 	{
 		FQuadCommsControlsData_t     controls;
 		FQuadCommsFlightStatusData_t flightStatus;
-	};
+	} msgData;
 } FQuadCommsMsg_t;
 
 static FQuadCommsInfoStruct_t mCommsInfoStruct;
@@ -134,11 +134,11 @@ FStatus FQuadComms_SendControls( const FQuadAxisValue inPitch, const FQuadAxisVa
 	require_action( mCommsInfoStruct.isInitialized, exit, status = FStatus_NotInitialized );
 	
 	// Structure the data into a message, with the first byte as the type of message 
-	msg.type            = FQuadCommsDataType_Controls;
-	msg.controls.pitch  = inPitch;
-	msg.controls.roll   = inRoll;
-	msg.controls.yaw    = inYaw;
-	msg.controls.thrust = inThrust;
+	msg.type                    = FQuadCommsDataType_Controls;
+	msg.msgData.controls.pitch  = inPitch;
+	msg.msgData.controls.roll   = inRoll;
+	msg.msgData.controls.yaw    = inYaw;
+	msg.msgData.controls.thrust = inThrust;
 	
 	// Clear ACK status before we send the message
 	mCommsInfoStruct.ackReceived = false;
@@ -165,9 +165,9 @@ FStatus FQuadComms_SendFlightBatteryLevelAndRSSI( const FQuadBatteryLevel inBatt
 	require_action( mCommsInfoStruct.isInitialized, exit, status = FStatus_NotInitialized );
 	
 	// Structure the data into a message, with the first byte as the type of message
-	msg.type                      = FQuadCommsDataType_FlightStatus;
-	msg.flightStatus.batteryLevel = inBatteryLevel;
-	msg.flightStatus.RSSI         = inFlightRSSI;
+	msg.type                              = FQuadCommsDataType_FlightStatus;
+	msg.msgData.flightStatus.batteryLevel = inBatteryLevel;
+	msg.msgData.flightStatus.RSSI         = inFlightRSSI;
 
 	// Clear ACK status before we send the message
 	mCommsInfoStruct.ackReceived = false;
@@ -260,8 +260,8 @@ static FStatus _FQuadComms_WaitForAck( uint16_t inTimeoutMs )
 	FStatus status = FStatus_Failed;
 	PlatformStatus platformStatus;
 	
-	uint64_t startTime;
-	uint64_t currentTime;
+	uint32_t startTime;
+	uint32_t currentTime;
 	
 	platformStatus = PlatformTimer_GetTime( &currentTime );
 	require_noerr( status, exit );
@@ -305,10 +305,10 @@ void _FQuadComms_MsgReceivedISR( uint8_t *const inMsg, const size_t inMsgLen, co
 		case FQuadCommsDataType_Controls:
 		{
 			// Message sent from controller to flight
-			mCommsInfoStruct.latestPitch      = msg->controls.pitch;
-			mCommsInfoStruct.latestRoll       = msg->controls.roll;
-			mCommsInfoStruct.latestYaw        = msg->controls.yaw;
-			mCommsInfoStruct.latestThrust     = msg->controls.thrust;
+			mCommsInfoStruct.latestPitch      = msg->msgData.controls.pitch;
+			mCommsInfoStruct.latestRoll       = msg->msgData.controls.roll;
+			mCommsInfoStruct.latestYaw        = msg->msgData.controls.yaw;
+			mCommsInfoStruct.latestThrust     = msg->msgData.controls.thrust;
 			mCommsInfoStruct.latestFlightRSSI = inRSSI;
 			
 			break;
@@ -316,8 +316,8 @@ void _FQuadComms_MsgReceivedISR( uint8_t *const inMsg, const size_t inMsgLen, co
 		case FQuadCommsDataType_FlightStatus:
 		{
 			// Message sent from flight to controller
-			mCommsInfoStruct.latestBatteryLevel   = msg->flightStatus.batteryLevel;
-			mCommsInfoStruct.latestFlightRSSI     = msg->flightStatus.RSSI;
+			mCommsInfoStruct.latestBatteryLevel   = msg->msgData.flightStatus.batteryLevel;
+			mCommsInfoStruct.latestFlightRSSI     = msg->msgData.flightStatus.RSSI;
 			mCommsInfoStruct.latestControllerRSSI = inRSSI;
 		}
 	}

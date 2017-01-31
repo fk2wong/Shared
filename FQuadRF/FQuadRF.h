@@ -15,7 +15,7 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define FQUADRF_MAX_MSG_DATA_LEN    ( 10 )
+#define FQUADRF_MAX_MSG_DATA_LEN    ( 16 )
 
 F_ENUM( uint8_t, FQuadRFTXStatus )
 {
