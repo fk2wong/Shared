@@ -143,8 +143,17 @@ FStatus FQuadComms_SendControls( const FQuadAxisValue inPitch, const FQuadAxisVa
 	// Clear ACK status before we send the message
 	mCommsInfoStruct.ackReceived = false;
 	
+	// Increment the frame ID
+	mCommsInfoStruct.lastFrameID++;
+	
+	// Make sure it's not 0; this will not receive an ACK. Increment it again if it is
+	if ( mCommsInfoStruct.lastFrameID == 0 )
+	{
+		mCommsInfoStruct.lastFrameID++;
+	}
+	
 	// Send message
-	status = FQuadRF_SendMessage(( uint8_t* )&msg, FQUAD_COMMS_CONTROLS_MSG_LEN, ++mCommsInfoStruct.lastFrameID, HTONL( FQUAD_ADDRH ), HTONL( FQUAD_ADDRL ));
+	status = FQuadRF_SendMessage(( uint8_t* )&msg, FQUAD_COMMS_CONTROLS_MSG_LEN, mCommsInfoStruct.lastFrameID, HTONL( FQUAD_ADDRH ), HTONL( FQUAD_ADDRL ));
 	require_noerr( status, exit );
 	
 	// Wait for ACK
@@ -172,8 +181,17 @@ FStatus FQuadComms_SendFlightBatteryLevelAndRSSI( const FQuadBatteryLevel inBatt
 	// Clear ACK status before we send the message
 	mCommsInfoStruct.ackReceived = false;
 	
+	// Increment the frame ID
+	mCommsInfoStruct.lastFrameID++;
+		
+	// Make sure it's not 0; this will not receive an ACK. Increment it again if it is
+	if ( mCommsInfoStruct.lastFrameID == 0 )
+	{
+		mCommsInfoStruct.lastFrameID++;
+	}
+	
 	// Send message
-	status = FQuadRF_SendMessage(( uint8_t* )&msg, FQUAD_COMMS_FLIGHT_STATUS_MSG_LEN, ++mCommsInfoStruct.lastFrameID, HTONL( FQUAD_ADDRH ), HTONL( FQUAD_ADDRL ));
+	status = FQuadRF_SendMessage(( uint8_t* )&msg, FQUAD_COMMS_FLIGHT_STATUS_MSG_LEN, mCommsInfoStruct.lastFrameID, HTONL( FQUAD_ADDRH ), HTONL( FQUAD_ADDRL ));
 	require_noerr( status, exit );
 	
 	// Wait for ACK
