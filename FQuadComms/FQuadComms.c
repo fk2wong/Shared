@@ -22,9 +22,9 @@
 #define FQUADTX_ADDRH ( 0x13A200 )
 #define FQUADTX_ADDRL ( 0x40B39D9D )
 
-#define FQUAD_COMMS_START_FRAME_ID ( 0 )
+#define FQUAD_COMMS_START_FRAME_ID ( 1 )
 
-#define FQUAD_COMMS_ACK_TIMEOUT_MS ( 1000 ) // XBee Datasheet: (200 + 48ms wait) * 4
+#define FQUAD_COMMS_ACK_TIMEOUT_MS ( 1000 ) // XBee Datasheet: (200 + 48ms wait) * 4 
 
 //===============================//
 //           Typedefs            //
@@ -148,8 +148,8 @@ FStatus FQuadComms_SendControls( const FQuadAxisValue inPitch, const FQuadAxisVa
 	require_noerr( status, exit );
 	
 	// Wait for ACK
-	//status = _FQuadComms_WaitForAck( FQUAD_COMMS_ACK_TIMEOUT_MS );
-	//require_noerr( status, exit );
+	status = _FQuadComms_WaitForAck( FQUAD_COMMS_ACK_TIMEOUT_MS );
+	require_noerr( status, exit );
 	
 exit:
 	return status;
@@ -264,7 +264,7 @@ static FStatus _FQuadComms_WaitForAck( uint16_t inTimeoutMs )
 	uint32_t currentTime;
 	
 	platformStatus = PlatformTimer_GetTime( &currentTime );
-	require_noerr( status, exit );
+	require_noerr( platformStatus, exit );
 	
 	startTime = currentTime;
 	
@@ -328,6 +328,7 @@ exit:
 
 void _FQuadComms_ACKReceivedISR( const uint8_t inFrameID, const FQuadRFTXStatus inACKStatus )
 {
+	
 	// If the ack frame matches the last one we sent
 	if ( mCommsInfoStruct.lastFrameID == inFrameID )
 	{

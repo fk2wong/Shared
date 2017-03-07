@@ -19,17 +19,23 @@
 #define FQUADRF_UART_RING_BUFFER_SIZE ( 64 )
 
 #define UART_BITS_PER_BYTE                ( 10 )
-#define FQUADRF_MAX_PACKET_SEND_TIME_MS     (( uint16_t )((( uint32_t )UART_BITS_PER_BYTE * FQUADRF_MAX_PACKET_SIZE * 1000 ) / ( FQUADRF_UART_BAUD_RATE )))
+#define FQUADRF_MAX_PACKET_SEND_TIME_MS   (( uint16_t )((( uint32_t )UART_BITS_PER_BYTE * FQUADRF_MAX_PACKET_SIZE * 1000 ) / ( FQUADRF_UART_BAUD_RATE )))
 
-#define FQUADRF_START_BYTE ( 0x7E )
+#define FQUADRF_START_BYTE  ( 0x7E )
 #define FQUADRF_HEADER_BYTES ( 3 )
 #define FQUADRF_CHECKSUM_BYTES ( 1 )
 #define FQUADRF_PACKET_OVERHEAD_BYTES ( FQUADRF_HEADER_BYTES + FQUADRF_CHECKSUM_BYTES )
 #define FQUADRF_DATA_FRAME_OVERHEAD_BYTES ( 11 )
+
+// Worst case, every character needs an escape character
+#define FQUADRF_MAX_MSG_DATA_LEN ( FQUADRF_MAX_MSG_RAW_DATA_LEN * 2 ) 
+
 #define FQUADRF_MAX_FRAME_SIZE ( FQUADRF_MAX_MSG_DATA_LEN + FQUADRF_DATA_FRAME_OVERHEAD_BYTES )
 #define FQUADRF_MAX_PACKET_SIZE ( FQUADRF_MAX_FRAME_SIZE + FQUADRF_PACKET_OVERHEAD_BYTES )
 
-#define FQUADRF_RX_MSG_NON_DATA_BYTES ( 10 )
+#define FQUADRF_ESCAPE_CHAR ( 0x7D )
+#define FQUADRF_XOR_CHAR    ( 0x20 )
+#define FQUADRF_CHAR_MUST_BE_ESCAPED( X ) ((( X ) == mEscapeChars[0] ) || (( X ) == mEscapeChars[1] ) || (( X ) == mEscapeChars[2] ) || (( X ) == mEscapeChars[3] ))
 
 #define FQUAD_COMMS_WAKE_TIME_MS ( 4 )
 
@@ -99,8 +105,10 @@ typedef struct
 	PlatformGPIO_t      sleepPin;
 	PlatformRingBuffer *uartBuffer;
 	
+	uint8_t numEscapedCharsInTXPacket;
+	
 	// For managing ring buffer data and assembling packets
-	uint8_t bytesLeftInPacket;
+	uint16_t bytesLeftInRXPacket;
 	
 	// Callback info
 	FQuadRF_ACKReceivedISR ackReceivedISR;
@@ -108,8 +116,14 @@ typedef struct
 	
 } FQuadRFInfo_t;
 
+//================================//
+//         Local Variables        //
+//================================//
+
 static FQuadRFInfo_t mRFInfoStruct;
 
+static const char mEscapeChars[] = { 0x7E, 0x7D, 0x11, 0x13 };
+	
 //================================//
 // Internal Function Declarations //
 //================================//
@@ -122,7 +136,8 @@ void _FQuadRF_ByteReceivedISR( PlatformRingBuffer *const inRingBuffer,
                                                              const uint8_t* const      inDataReceived,
                                                              const size_t              inDataLen,
                                                              const size_t              inBufferBytesUsed );
-															 
+
+static FStatus _FQuadRF_UnescapeChars( uint8_t * ioData, const size_t inEscapedLen );
 static FStatus _FQuadRF_ExtractDataAndSendCallback( uint8_t *const inData, const size_t inDataLen );
 
 //=============================//
@@ -162,7 +177,9 @@ FStatus FQuadRF_Init( const PlatformGPIO_t inSleepPin, FQuadRF_MsgReceivedISR in
 	mRFInfoStruct.ackReceivedISR = inACKReceivedISR;
 	
 	// Indicate we are not waiting for any bytes in an ongoing packet RX transmission
-	mRFInfoStruct.bytesLeftInPacket = 0;
+	mRFInfoStruct.bytesLeftInRXPacket = 0;
+	
+	mRFInfoStruct.numEscapedCharsInTXPacket = 0;
 	
 	// Initialization complete
 	mRFInfoStruct.isInitialized = true;
@@ -241,18 +258,38 @@ FStatus FQuadRF_Sleep()
 static FStatus _FQuadRF_SerializePacket( FQuadRFPacket_t *const outPacket, void *const inFrameData, uint8_t inFrameLen )
 {
 	FStatus status = FStatus_Failed;
+	uint8_t packetDataIndex = 0;
 	
  	require_action( outPacket, exit, status = FStatus_InvalidArgument );
  	require_action( inFrameData, exit , status = FStatus_InvalidArgument );
  	require_action( inFrameLen, exit, status = FStatus_InvalidArgument );
 		
-	// Fill packet info
+	// Set start byte
 	outPacket->startByte   = FQUADRF_START_BYTE;
+	
+	// Set the frame length
 	outPacket->frameLength = HTONS( inFrameLen );
 	
-	memcpy( outPacket->frameData, inFrameData, inFrameLen );
+	// Reset number of escaped characters
+	mRFInfoStruct.numEscapedCharsInTXPacket = 0;
 	
-	// Get packet checksum
+	// Copy frame data into the packet, escaping characters when necessary
+	for ( uint8_t i = 0; i < inFrameLen; i++ )
+	{
+		if ( FQUADRF_CHAR_MUST_BE_ESCAPED( (( uint8_t* )inFrameData )[i] ))
+		{
+			outPacket->frameData[packetDataIndex++] = FQUADRF_ESCAPE_CHAR;
+			outPacket->frameData[packetDataIndex++] = (( uint8_t* )inFrameData )[i] ^ FQUADRF_XOR_CHAR;
+			mRFInfoStruct.numEscapedCharsInTXPacket++;
+		}
+		else
+		{
+			// Copy the raw character
+			outPacket->frameData[packetDataIndex++] = (( uint8_t* )inFrameData )[i];
+		}
+	}
+	
+	// Get packet checksum, using data before being escaped
 	status = _FQuadRF_GetChecksum( inFrameData, inFrameLen, &outPacket->checksum );
 exit:
 	return status;
@@ -299,7 +336,7 @@ static FStatus _FQuadRF_SendPacket( FQuadRFPacket_t *const inPacket )
 	require_noerr( platformStatus, exit );
 	
 	// Send the frame data
-	platformStatus = PlatformUART_Transmit(( uint8_t* )&inPacket->frameData, NTOHS( inPacket->frameLength ));
+	platformStatus = PlatformUART_Transmit(( uint8_t* )&inPacket->frameData, NTOHS( inPacket->frameLength ) + mRFInfoStruct.numEscapedCharsInTXPacket );
 	require_noerr( platformStatus, exit );
 	
 	// Send checksum
@@ -320,15 +357,17 @@ void _FQuadRF_ByteReceivedISR( PlatformRingBuffer *const inRingBuffer,
 	// since the only source writing to the ring buffer is the UART,
 	// which is one byte at a time.
 	PlatformStatus status;
-	uint8_t data[FQUADRF_MAX_PACKET_SIZE];
 	uint16_t rawLength;
+	
+	uint8_t data[FQUADRF_MAX_PACKET_SIZE];
+	uint8_t calcedChecksum;
 	
 	require_quiet( inRingBuffer, exit );
 	require_quiet( inDataReceived, exit );
 	require_quiet( inDataLen == 1, exit );
 	
 	// If this is the start of a new packet ( there are no more bytes in the previous packet, and we received a new byte )
-	if ( mRFInfoStruct.bytesLeftInPacket == 0 )
+	if ( mRFInfoStruct.bytesLeftInRXPacket == 0 )
 	{
 		// If this is the first byte in the packet, then ensure this is the start byte. 
 		// If not, something went wrong, so flush this byte.
@@ -351,28 +390,99 @@ void _FQuadRF_ByteReceivedISR( PlatformRingBuffer *const inRingBuffer,
 			// Get the length of the packet's frame
 			rawLength = ( data[1] << 8 ) | data[2];
 			
-			mRFInfoStruct.bytesLeftInPacket = NTOHS( rawLength ) + FQUADRF_CHECKSUM_BYTES;
+			// Get the number of remaining bytes for this RX packet, including checksum
+			mRFInfoStruct.bytesLeftInRXPacket = rawLength + FQUADRF_CHECKSUM_BYTES;
 		}
 	}
 	// Otherwise we are waiting for bytes in the packet, after a header has already been received. 
 	else
 	{
-		// Decrement the number of bytes we are waiting for
-		mRFInfoStruct.bytesLeftInPacket--;
-		
-		// If the packet is now complete, package the relevant data and send it to upper layers.
-		if ( mRFInfoStruct.bytesLeftInPacket == 0 )
+		// Decrement the number of bytes we are waiting for, since we just received one
+		mRFInfoStruct.bytesLeftInRXPacket--;
+				
+		// If the packet is now complete with this byte, package the relevant data and send it to upper layers.
+		// Note that we don't need to check for escpaed characters if this is the last byte ( checksum )
+		if ( mRFInfoStruct.bytesLeftInRXPacket == 0 )
 		{
+			// Get the entire packet
 			status = PlatformRingBuffer_ReadBuffer( inRingBuffer, data, inBufferBytesUsed );
 			require_noerr_quiet( status, exit );
+					
+			// Remove escaped chars
+			status = _FQuadRF_UnescapeChars( data, inBufferBytesUsed );
+			require_noerr_quiet( status, exit );
+			
+			// Verify checksum
+			status = _FQuadRF_GetChecksum( (( FQuadRFPacket_t* )data)->frameData, (( FQuadRFPacket_t* )data)->frameLength, &calcedChecksum );
+			require_noerr_quiet( status, exit );
+			
+			// Verify that checksum == current byte
+			require_quiet( calcedChecksum == *inDataReceived, exit );
 			
 			status = _FQuadRF_ExtractDataAndSendCallback( data, inBufferBytesUsed );
 			require_noerr_quiet( status, exit );
+			
+		}
+		else
+		// We are still receiving data as part of the frame data ( not checksum )
+		{
+			// If this is an escaped character, then we need to wait for an additional byte
+			if ( FQUADRF_CHAR_MUST_BE_ESCAPED( *inDataReceived ))
+			{
+				mRFInfoStruct.bytesLeftInRXPacket++;
+			}
 		}
 	}
 	
 exit:
 	return;
+}
+
+static FStatus _FQuadRF_UnescapeChars( uint8_t * ioData, const size_t inEscapedLen )
+{
+	FStatus status = FStatus_Failed;
+	
+	FQuadRFPacket_t *rawPacket;
+	
+	FQuadRFPacket_t unescapedPacket;
+	uint8_t         numCumulatedEscapedChars = 0;
+	
+	require_action_quiet( ioData, exit, status = FStatus_InvalidArgument );
+	require_action_quiet( inEscapedLen, exit, status = FStatus_InvalidArgument );
+	
+	// Cast raw data into packet
+	rawPacket = ( FQuadRFPacket_t* )ioData;
+	
+	// Copy all except frame data
+	unescapedPacket.startByte = rawPacket->startByte;
+	unescapedPacket.frameLength = NTOHS( rawPacket->frameLength );
+	
+	// Loop through frame data and unescape chars
+	for ( uint8_t i = 0; i < unescapedPacket.frameLength; i++ )
+	{		
+		if ( FQUADRF_CHAR_MUST_BE_ESCAPED( rawPacket->frameData[i] ))
+		{
+			// If this character is an escape character, skip it and XOR the next byte with 0x20
+			unescapedPacket.frameData[i] = rawPacket->frameData[i + 1 + numCumulatedEscapedChars] ^ FQUADRF_XOR_CHAR ;
+			numCumulatedEscapedChars++;
+		}
+		else
+		{
+			// Copy the raw character
+			unescapedPacket.frameData[i] = rawPacket->frameData[i + numCumulatedEscapedChars];
+		}
+	}
+	
+	// Checksum must be found since the packet structure over the wire is not the same as ours ( no padding for max size packets )
+	// Note: it is not this function's duty to verify the checksum, only extract it from the raw data.
+	unescapedPacket.checksum = (( uint8_t* )rawPacket )[FQUADRF_HEADER_BYTES + unescapedPacket.frameLength + numCumulatedEscapedChars];
+	
+	// Now overwrite the old packet with the new unescaped one
+	memcpy( rawPacket, &unescapedPacket, sizeof( FQuadRFPacket_t ));
+	
+	status = FStatus_Success;
+exit:
+	return status;
 }
 
 static FStatus _FQuadRF_ExtractDataAndSendCallback( uint8_t *const inData, const size_t inDataLen )
