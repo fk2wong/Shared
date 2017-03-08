@@ -196,7 +196,7 @@ FStatus FQuadComms_SendFlightBatteryLevelAndRSSI( const FQuadBatteryLevel inBatt
 	mCommsInfoStruct.ackReceived = false;
 	
 	// Send message
-	status = FQuadRF_SendMessage(( uint8_t* )&msg, FQUAD_COMMS_FLIGHT_STATUS_MSG_LEN, mCommsInfoStruct.lastFrameID, HTONL( FQUAD_ADDRH ), HTONL( FQUAD_ADDRL ));
+	status = FQuadRF_SendMessage(( uint8_t* )&msg, FQUAD_COMMS_FLIGHT_STATUS_MSG_LEN, mCommsInfoStruct.lastFrameID, HTONL( FQUADTX_ADDRH ), HTONL( FQUADTX_ADDRL ));
 	require_noerr( status, exit );
 	
 	// Wait for ACK
