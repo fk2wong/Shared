@@ -25,7 +25,8 @@
 #define FQUAD_COMMS_START_FRAME_ID ( 0x01 )
 #define FQUAD_COMMS_MAX_FRAME_ID   ( 0xFF )
 
-#define FQUAD_COMMS_ACK_TIMEOUT_MS ( 1000 ) // XBee Datasheet: (200 + 48ms wait) * 4 
+#define FQUAD_COMMS_ACK_TIMEOUT_MS ( 1000u ) // XBee Datasheet: (200 + 48ms wait) * 4 
+#define FQUAD_COMMS_COMMUNICATION_TIMEOUT_MS ( 2000u ) // Should be > twice the period at which the flight sends updates to the controller, which is the longest comms period
 
 //===============================//
 //           Typedefs            //
@@ -53,6 +54,8 @@ typedef struct
 	uint8_t             lastFrameID;          // Keep track of the frame #, increments per msg.
 	uint8_t             latestACKStatus;
 	volatile bool       ackReceived;
+	
+	uint32_t            lastReceivedPacketTimeMs;
 	
 } FQuadCommsInfoStruct_t;
 
@@ -110,6 +113,10 @@ FStatus FQuadComms_Init( const PlatformGPIO_t inSleepPin )
 	// Initialize timer for timeouts. May be already intialized by other modules.
 	platformStatus = PlatformTimer_Init();
 	require(( platformStatus == PlatformStatus_Success ) || ( platformStatus == PlatformStatus_AlreadyInitialized ), exit );
+	
+	// Set the last received packet time to be now
+	platformStatus = PlatformTimer_GetTime( &mCommsInfoStruct.lastReceivedPacketTimeMs );
+	require_noerr( platformStatus, exit );
 	
 	// Initialize frame IDs, for matching ACKs
 	mCommsInfoStruct.lastFrameID = FQUAD_COMMS_START_FRAME_ID;
@@ -213,9 +220,22 @@ FStatus FQuadComms_GetLatestControls( FQuadAxisValue *const   outPitch,
 									  FQuadThrustValue *const outThrust )
 {
 	FStatus status = FStatus_InvalidArgument;
+	uint32_t currentTime;
 	
 	// Make sure the module is initialized
 	require_action( mCommsInfoStruct.isInitialized, exit, status = FStatus_NotInitialized );
+	
+	// Take critical section
+	PlatformInterrupt_DisableGlobalInterrupts();
+	
+	status = PlatformTimer_GetTime( &currentTime );
+	require_noerr( status, exit );
+	
+	if (( currentTime - mCommsInfoStruct.lastReceivedPacketTimeMs ) > FQUAD_COMMS_COMMUNICATION_TIMEOUT_MS )
+	{
+		status = FStatus_Timeout;
+		goto exit;
+	}
 	
 	// Output battery level
 	*outPitch   = mCommsInfoStruct.latestPitch;
@@ -225,30 +245,58 @@ FStatus FQuadComms_GetLatestControls( FQuadAxisValue *const   outPitch,
 
 	status = FStatus_Success;
 exit:
+	PlatformInterrupt_EnableGlobalInterrupts();
 	return status;
 }
 
 FStatus FQuadComms_GetLatestFlightBatteryLevel( FQuadBatteryLevel *const outBatteryLevel )
 {
 	FStatus status = FStatus_InvalidArgument;
+	uint32_t currentTime;
 	
 	// Make sure the module is initialized
 	require_action( mCommsInfoStruct.isInitialized, exit, status = FStatus_NotInitialized );
+	
+	// Take critical section
+	PlatformInterrupt_DisableGlobalInterrupts();
+	
+	status = PlatformTimer_GetTime( &currentTime );
+	require_noerr( status, exit );
+		
+	if (( currentTime - mCommsInfoStruct.lastReceivedPacketTimeMs ) > FQUAD_COMMS_COMMUNICATION_TIMEOUT_MS )
+	{
+		status = FStatus_Timeout;
+		goto exit;
+	}
 	
 	// Output battery level
 	*outBatteryLevel  = mCommsInfoStruct.latestBatteryLevel;
 
 	status = FStatus_Success;
 exit:
+	PlatformInterrupt_EnableGlobalInterrupts();
 	return status;
 }
 
 FStatus FQuadComms_GetLatestRSSI( FQuadRSSI *const outControllerRSSI, FQuadRSSI *const outFlightRSSI )
 {
 	FStatus status = FStatus_InvalidArgument;
+	uint32_t currentTime;
 	
 	// Make sure the module is initialized
 	require_action( mCommsInfoStruct.isInitialized, exit, status = FStatus_NotInitialized );
+	
+	// Take critical section
+	PlatformInterrupt_DisableGlobalInterrupts();
+	
+	status = PlatformTimer_GetTime( &currentTime );
+	require_noerr( status, exit );
+	
+	if (( currentTime - mCommsInfoStruct.lastReceivedPacketTimeMs ) > FQUAD_COMMS_COMMUNICATION_TIMEOUT_MS )
+	{
+		status = FStatus_Timeout;
+		goto exit;
+	}
 	
 	if ( outControllerRSSI != NULL )
 	{
@@ -261,6 +309,7 @@ FStatus FQuadComms_GetLatestRSSI( FQuadRSSI *const outControllerRSSI, FQuadRSSI 
 
 	status = FStatus_Success;
 exit:
+	PlatformInterrupt_EnableGlobalInterrupts();
 	return status;
 }
 
@@ -348,6 +397,9 @@ void _FQuadComms_MsgReceivedISR( uint8_t *const inMsg, const size_t inMsgLen, co
 			break;
 		}
 	}
+	
+	// Update the latest packet received time
+	PlatformTimer_GetTime( &mCommsInfoStruct.lastReceivedPacketTimeMs );
 	
 exit:
 	return;
