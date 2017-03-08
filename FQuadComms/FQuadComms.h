@@ -34,7 +34,7 @@ FStatus FQuadComms_SendControls( const FQuadAxisValue inPitch, const FQuadAxisVa
 /*!
  *\brief    Receives controls from the controller.
  */
-FStatus FQuadComms_ReceiveControls( FQuadAxisValue *const   outPitch,
+FStatus FQuadComms_GetLatestControls( FQuadAxisValue *const   outPitch,
 									FQuadAxisValue *const   outRoll,
 									FQuadAxisValue *const   outYaw,
 									FQuadThrustValue *const outThrust );

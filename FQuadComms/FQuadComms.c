@@ -207,10 +207,10 @@ exit:
 	return status;
 }
 
-FStatus FQuadComms_ReceiveControls( FQuadAxisValue *const   outPitch, 
-                                    FQuadAxisValue *const   outRoll, 
-									FQuadAxisValue *const   outYaw, 
-									FQuadThrustValue *const outThrust )
+FStatus FQuadComms_GetLatestControls( FQuadAxisValue *const   outPitch, 
+									  FQuadAxisValue *const   outRoll, 
+									  FQuadAxisValue *const   outYaw, 
+									  FQuadThrustValue *const outThrust )
 {
 	FStatus status = FStatus_InvalidArgument;
 	
@@ -317,8 +317,8 @@ void _FQuadComms_MsgReceivedISR( uint8_t *const inMsg, const size_t inMsgLen, co
 {
 	FQuadCommsMsg_t *msg;
 	
-	require_noerr_quiet( inMsg, exit );
-	require_noerr_quiet( inMsgLen, exit );
+	require_quiet( inMsg, exit );
+	require_quiet( inMsgLen, exit );
 	
 	// Cast to appropriate type
 	msg = ( FQuadCommsMsg_t* )inMsg;
@@ -332,8 +332,7 @@ void _FQuadComms_MsgReceivedISR( uint8_t *const inMsg, const size_t inMsgLen, co
 			mCommsInfoStruct.latestRoll       = msg->msgData.controls.roll;
 			mCommsInfoStruct.latestYaw        = msg->msgData.controls.yaw;
 			mCommsInfoStruct.latestThrust     = msg->msgData.controls.thrust;
-			mCommsInfoStruct.latestFlightRSSI = inRSSI;
-			
+			mCommsInfoStruct.latestFlightRSSI = inRSSI;			
 			break;
 		}
 		case FQuadCommsDataType_FlightStatus:
@@ -342,6 +341,11 @@ void _FQuadComms_MsgReceivedISR( uint8_t *const inMsg, const size_t inMsgLen, co
 			mCommsInfoStruct.latestBatteryLevel   = msg->msgData.flightStatus.batteryLevel;
 			mCommsInfoStruct.latestFlightRSSI     = msg->msgData.flightStatus.RSSI;
 			mCommsInfoStruct.latestControllerRSSI = inRSSI;
+			break;
+		}
+		default:
+		{
+			break;
 		}
 	}
 	
