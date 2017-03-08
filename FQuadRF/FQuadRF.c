@@ -128,7 +128,7 @@ static const char mEscapeChars[] = { 0x7E, 0x7D, 0x11, 0x13 };
 // Internal Function Declarations //
 //================================//
 
-static FStatus _FQuadRF_GetChecksum( void *const inFrameData, size_t inFrameLen, uint8_t *const outChecksum );
+static FStatus _FQuadRF_GetRawChecksum( void *const inFrameData, size_t inFrameLen, uint8_t *const outChecksum );
 static FStatus _FQuadRF_SerializePacket( FQuadRFPacket_t *const outPacket, void *const inFrameData, uint8_t inFrameLen );
 static FStatus _FQuadRF_SendPacket( FQuadRFPacket_t *const inPacket );
 
@@ -290,12 +290,21 @@ static FStatus _FQuadRF_SerializePacket( FQuadRFPacket_t *const outPacket, void 
 	}
 	
 	// Get packet checksum, using data before being escaped
-	status = _FQuadRF_GetChecksum( inFrameData, inFrameLen, &outPacket->checksum );
+	status = _FQuadRF_GetRawChecksum( inFrameData, inFrameLen, &outPacket->checksum );
+	
+	// If this checksum must be escaped, then add another escape character to the packet data, and use the escaped checksum
+	if ( FQUADRF_CHAR_MUST_BE_ESCAPED( outPacket->checksum ))
+	{
+		mRFInfoStruct.numEscapedCharsInTXPacket++;
+		outPacket->frameData[packetDataIndex++] = FQUADRF_ESCAPE_CHAR;
+		outPacket->checksum ^= FQUADRF_XOR_CHAR;
+	}
+	
 exit:
 	return status;
 }
 
-static FStatus _FQuadRF_GetChecksum( void *const inFrameData, size_t inFrameLen, uint8_t *const outChecksum )
+static FStatus _FQuadRF_GetRawChecksum( void *const inFrameData, size_t inFrameLen, uint8_t *const outChecksum )
 {
 	FStatus status = FStatus_Failed;
 	uint8_t checksum = 0;
@@ -397,11 +406,14 @@ void _FQuadRF_ByteReceivedISR( PlatformRingBuffer *const inRingBuffer,
 	// Otherwise we are waiting for bytes in the packet, after a header has already been received. 
 	else
 	{
-		// Decrement the number of bytes we are waiting for, since we just received one
-		mRFInfoStruct.bytesLeftInRXPacket--;
+		// Decrement the number of bytes we are waiting for, since we just received one, as long as it's not an escape character
+		// If this is an escape character, then don't count this as part of the frame length or bytesLeftInRXPacket, and wait for next byte 
+		if ( !FQUADRF_CHAR_MUST_BE_ESCAPED( *inDataReceived ))
+		{
+			mRFInfoStruct.bytesLeftInRXPacket--;
+		}
 				
 		// If the packet is now complete with this byte, package the relevant data and send it to upper layers.
-		// Note that we don't need to check for escpaed characters if this is the last byte ( checksum )
 		if ( mRFInfoStruct.bytesLeftInRXPacket == 0 )
 		{
 			// Get the entire packet
@@ -413,24 +425,14 @@ void _FQuadRF_ByteReceivedISR( PlatformRingBuffer *const inRingBuffer,
 			require_noerr_quiet( status, exit );
 			
 			// Verify checksum
-			status = _FQuadRF_GetChecksum( (( FQuadRFPacket_t* )data)->frameData, (( FQuadRFPacket_t* )data)->frameLength, &calcedChecksum );
+			status = _FQuadRF_GetRawChecksum( (( FQuadRFPacket_t* )data)->frameData, (( FQuadRFPacket_t* )data)->frameLength, &calcedChecksum );
 			require_noerr_quiet( status, exit );
 			
 			// Verify that checksum == current byte
-			require_quiet( calcedChecksum == *inDataReceived, exit );
+			require_quiet( calcedChecksum == (( FQuadRFPacket_t* )data)->checksum, exit );
 			
 			status = _FQuadRF_ExtractDataAndSendCallback( data, inBufferBytesUsed );
 			require_noerr_quiet( status, exit );
-			
-		}
-		else
-		// We are still receiving data as part of the frame data ( not checksum )
-		{
-			// If this is an escaped character, then we need to wait for an additional byte
-			if ( FQUADRF_CHAR_MUST_BE_ESCAPED( *inDataReceived ))
-			{
-				mRFInfoStruct.bytesLeftInRXPacket++;
-			}
 		}
 	}
 	
@@ -445,7 +447,10 @@ static FStatus _FQuadRF_UnescapeChars( uint8_t * ioData, const size_t inEscapedL
 	FQuadRFPacket_t *rawPacket;
 	
 	FQuadRFPacket_t unescapedPacket;
+	uint8_t         unescapedIndex = 0;
 	uint8_t         numCumulatedEscapedChars = 0;
+	
+	uint8_t *checksumByte;
 	
 	require_action_quiet( ioData, exit, status = FStatus_InvalidArgument );
 	require_action_quiet( inEscapedLen, exit, status = FStatus_InvalidArgument );
@@ -458,24 +463,32 @@ static FStatus _FQuadRF_UnescapeChars( uint8_t * ioData, const size_t inEscapedL
 	unescapedPacket.frameLength = NTOHS( rawPacket->frameLength );
 	
 	// Loop through frame data and unescape chars
-	for ( uint8_t i = 0; i < unescapedPacket.frameLength; i++ )
+	for ( unescapedIndex = 0; unescapedIndex < unescapedPacket.frameLength; unescapedIndex++ )
 	{		
-		if ( FQUADRF_CHAR_MUST_BE_ESCAPED( rawPacket->frameData[i] ))
+		if ( FQUADRF_CHAR_MUST_BE_ESCAPED( rawPacket->frameData[unescapedIndex + numCumulatedEscapedChars] ))
 		{
 			// If this character is an escape character, skip it and XOR the next byte with 0x20
-			unescapedPacket.frameData[i] = rawPacket->frameData[i + 1 + numCumulatedEscapedChars] ^ FQUADRF_XOR_CHAR ;
 			numCumulatedEscapedChars++;
+			unescapedPacket.frameData[unescapedIndex] = rawPacket->frameData[unescapedIndex + numCumulatedEscapedChars] ^ FQUADRF_XOR_CHAR ;
 		}
 		else
 		{
 			// Copy the raw character
-			unescapedPacket.frameData[i] = rawPacket->frameData[i + numCumulatedEscapedChars];
+			unescapedPacket.frameData[unescapedIndex] = rawPacket->frameData[unescapedIndex + numCumulatedEscapedChars];
 		}
 	}
 	
 	// Checksum must be found since the packet structure over the wire is not the same as ours ( no padding for max size packets )
 	// Note: it is not this function's duty to verify the checksum, only extract it from the raw data.
-	unescapedPacket.checksum = (( uint8_t* )rawPacket )[FQUADRF_HEADER_BYTES + unescapedPacket.frameLength + numCumulatedEscapedChars];
+	checksumByte = &((( uint8_t* )rawPacket )[FQUADRF_HEADER_BYTES + unescapedPacket.frameLength + numCumulatedEscapedChars]);
+	
+	// If the checksum must be escaped, find the next byte and XOR it
+	if ( FQUADRF_CHAR_MUST_BE_ESCAPED( *checksumByte ))
+	{
+		checksumByte++;
+		*checksumByte ^= FQUADRF_XOR_CHAR;
+	}
+	unescapedPacket.checksum = *checksumByte;
 	
 	// Now overwrite the old packet with the new unescaped one
 	memcpy( rawPacket, &unescapedPacket, sizeof( FQuadRFPacket_t ));

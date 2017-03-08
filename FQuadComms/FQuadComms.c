@@ -22,7 +22,8 @@
 #define FQUADTX_ADDRH ( 0x13A200 )
 #define FQUADTX_ADDRL ( 0x40B39D9D )
 
-#define FQUAD_COMMS_START_FRAME_ID ( 1 )
+#define FQUAD_COMMS_START_FRAME_ID ( 0x01 )
+#define FQUAD_COMMS_MAX_FRAME_ID   ( 0xFF )
 
 #define FQUAD_COMMS_ACK_TIMEOUT_MS ( 1000 ) // XBee Datasheet: (200 + 48ms wait) * 4 
 
@@ -140,17 +141,19 @@ FStatus FQuadComms_SendControls( const FQuadAxisValue inPitch, const FQuadAxisVa
 	msg.msgData.controls.yaw    = inYaw;
 	msg.msgData.controls.thrust = inThrust;
 	
-	// Clear ACK status before we send the message
-	mCommsInfoStruct.ackReceived = false;
-	
-	// Increment the frame ID
-	mCommsInfoStruct.lastFrameID++;
-	
-	// Make sure it's not 0; this will not receive an ACK. Increment it again if it is
-	if ( mCommsInfoStruct.lastFrameID == 0 )
+	// Handle overflow of the frame ID
+	if ( mCommsInfoStruct.lastFrameID == FQUAD_COMMS_MAX_FRAME_ID )
 	{
+		mCommsInfoStruct.lastFrameID = FQUAD_COMMS_START_FRAME_ID;
+	}
+	else
+	{
+		// Increment the frame ID
 		mCommsInfoStruct.lastFrameID++;
 	}
+	
+	// Clear ACK status before we send the message
+	mCommsInfoStruct.ackReceived = false;
 	
 	// Send message
 	status = FQuadRF_SendMessage(( uint8_t* )&msg, FQUAD_COMMS_CONTROLS_MSG_LEN, mCommsInfoStruct.lastFrameID, HTONL( FQUAD_ADDRH ), HTONL( FQUAD_ADDRL ));
@@ -177,18 +180,20 @@ FStatus FQuadComms_SendFlightBatteryLevelAndRSSI( const FQuadBatteryLevel inBatt
 	msg.type                              = FQuadCommsDataType_FlightStatus;
 	msg.msgData.flightStatus.batteryLevel = inBatteryLevel;
 	msg.msgData.flightStatus.RSSI         = inFlightRSSI;
-
-	// Clear ACK status before we send the message
-	mCommsInfoStruct.ackReceived = false;
 	
-	// Increment the frame ID
-	mCommsInfoStruct.lastFrameID++;
-		
-	// Make sure it's not 0; this will not receive an ACK. Increment it again if it is
-	if ( mCommsInfoStruct.lastFrameID == 0 )
+	// Handle overflow of the frame ID
+	if ( mCommsInfoStruct.lastFrameID == FQUAD_COMMS_MAX_FRAME_ID )
 	{
+		mCommsInfoStruct.lastFrameID = FQUAD_COMMS_START_FRAME_ID;
+	}
+	else
+	{
+		// Increment the frame ID
 		mCommsInfoStruct.lastFrameID++;
 	}
+	
+	// Clear ACK status before we send the message
+	mCommsInfoStruct.ackReceived = false;
 	
 	// Send message
 	status = FQuadRF_SendMessage(( uint8_t* )&msg, FQUAD_COMMS_FLIGHT_STATUS_MSG_LEN, mCommsInfoStruct.lastFrameID, HTONL( FQUAD_ADDRH ), HTONL( FQUAD_ADDRL ));
@@ -346,7 +351,6 @@ exit:
 
 void _FQuadComms_ACKReceivedISR( const uint8_t inFrameID, const FQuadRFTXStatus inACKStatus )
 {
-	
 	// If the ack frame matches the last one we sent
 	if ( mCommsInfoStruct.lastFrameID == inFrameID )
 	{
