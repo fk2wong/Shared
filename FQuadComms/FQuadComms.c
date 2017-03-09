@@ -337,8 +337,12 @@ static FStatus _FQuadComms_WaitForAck( uint16_t inTimeoutMs )
 	
 	platformStatus = PlatformTimer_GetTime( &currentTime );
 	require_noerr( platformStatus, exit );
-	
+
+	// Start tracking the time, for timeout	
 	startTime = currentTime;
+	
+	// Set the status to timed-out, and if we receive an ACK, it will be set to success
+	status = FStatus_Timeout;
 	
 	// Loop until timed out, or ACK received
 	while ( ( uint16_t )( currentTime - startTime ) <= inTimeoutMs )
@@ -346,7 +350,14 @@ static FStatus _FQuadComms_WaitForAck( uint16_t inTimeoutMs )
 		if ( mCommsInfoStruct.ackReceived )
 		{
 			// return status of the ACK
-			status = ( mCommsInfoStruct.latestACKStatus == FQuadRFTXStatus_Success ) ? FStatus_Success : FStatus_Failed;
+			if ( mCommsInfoStruct.latestACKStatus == FQuadRFTXStatus_Success )
+			{
+				status = FStatus_Success;
+			}
+			else if ( mCommsInfoStruct.latestACKStatus == FQuadRFTXStatus_NACK )
+			{
+				status = FStatus_Timeout;
+			}
 			
 			// Reset ackReceived flag
 			mCommsInfoStruct.ackReceived = false;
