@@ -33,6 +33,8 @@ FStatus FQuadComms_SendControls( const FQuadAxisValue inPitch, const FQuadAxisVa
 
 /*!
  *\brief    Receives controls from the controller.
+ *
+ *\return   FStatus_Success if successfully got controls. FStatus_Timeout if no packet has been received in the past FQUAD_COMMS_COMMUNICATION_TIMEOUT_MS.
  */
 FStatus FQuadComms_GetLatestControls( FQuadAxisValue *const   outPitch,
 									FQuadAxisValue *const   outRoll,
@@ -46,11 +48,15 @@ FStatus FQuadComms_SendFlightBatteryLevelAndRSSI( const FQuadBatteryLevel inBatt
 									
 /*!
  *\brief    Gets the latest RSSI on the controller, as well as latest RSSI info sent from the quadcopter.
+ *
+ *\return   FStatus_Success if successfully got controls. FStatus_Timeout if no packet has been received in the past FQUAD_COMMS_COMMUNICATION_TIMEOUT_MS.
  */		
 FStatus FQuadComms_GetLatestRSSI( FQuadRSSI *const outControllerRSSI, FQuadRSSI *const outFlightRSSI );
 
 /*!
  *\brief    Gets the latest battery level sent from the quadcopter to the controller.
+ *
+ *\return   FStatus_Success if successfully got controls. FStatus_Timeout if no packet has been received in the past FQUAD_COMMS_COMMUNICATION_TIMEOUT_MS.
  */		
 FStatus FQuadComms_GetLatestFlightBatteryLevel( FQuadBatteryLevel *const outBatteryLevel );
 
