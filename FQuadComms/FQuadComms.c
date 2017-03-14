@@ -106,16 +106,17 @@ FStatus FQuadComms_Init( const PlatformGPIO_t inSleepPin )
 	// Check if already initialized
 	require_action( !mCommsInfoStruct.isInitialized, exit, status = FStatus_AlreadyInitialized );
 	
-	// Initialize the RF module
-	platformStatus = FQuadRF_Init( inSleepPin, _FQuadComms_MsgReceivedISR, _FQuadComms_ACKReceivedISR );
-	require_noerr( platformStatus, exit );
-	
 	// Initialize timer for timeouts. May be already intialized by other modules.
 	platformStatus = PlatformTimer_Init();
 	require(( platformStatus == PlatformStatus_Success ) || ( platformStatus == PlatformStatus_AlreadyInitialized ), exit );
 	
-	// Set the last received packet time to be now
+	// Set the last received packet time to be at least FQUAD_COMMS_COMMUNICATION_TIMEOUT_MS away from now, so that we do not expect to have valid data on startup
 	platformStatus = PlatformTimer_GetTime( &mCommsInfoStruct.lastReceivedPacketTimeMs );
+	mCommsInfoStruct.lastReceivedPacketTimeMs -= ( FQUAD_COMMS_COMMUNICATION_TIMEOUT_MS + 1 );
+	require_noerr( platformStatus, exit );
+	
+	// Initialize the RF module
+	platformStatus = FQuadRF_Init( inSleepPin, _FQuadComms_MsgReceivedISR, _FQuadComms_ACKReceivedISR );
 	require_noerr( platformStatus, exit );
 	
 	// Initialize frame IDs, for matching ACKs
