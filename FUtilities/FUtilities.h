@@ -16,6 +16,7 @@
 
 #define MAX( X, Y )   ((( X ) > ( Y )) ? ( X ) : ( Y ))
 #define MIN( X, Y )   ((( X ) < ( Y )) ? ( X ) : ( Y ))
+#define CLIP( X, A, B ) ( MAX( MIN( X, B ), A ))
 
 #define HTONS( X ) (((( uint16_t )( X ) & 0xFF00 ) >> 8 ) | ((( uint16_t )( X ) & 0xFF ) << 8 ))  
 #define HTONL( X ) (((( uint32_t )( X ) & 0xFF000000 ) >> 24 ) | \
