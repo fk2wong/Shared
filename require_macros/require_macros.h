@@ -79,7 +79,7 @@ do                                                   \
 }                                                    \
 while ( 0 )
 #else
-#define require_action( err, label, action ) //TODO
+#define require_action( assertation, label, action ) //TODO
 #endif // USE_PRODUCTION_CODE
 
 #if USE_PRODUCTION_CODE

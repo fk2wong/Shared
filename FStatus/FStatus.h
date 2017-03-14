@@ -11,4 +11,5 @@ F_ENUM( uint8_t, FStatus )
 	FStatus_AlreadyInitialized = 2,
 	FStatus_NotInitialized     = 3,
 	FStatus_InvalidArgument    = 4,
+	FStatus_Timeout            = 5,
 };
